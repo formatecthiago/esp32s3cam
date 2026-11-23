@@ -99,93 +99,27 @@ void handleFoto() {
     server.send(500, "text/plain", "Falha ao capturar foto");
     return;
   }
-  server.sendHeader("Content-Type", "image/jpeg");
-  server.sendHeader("Content-Length", String(fb->len));
-  server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+
+  uint8_t * jpg_buf = nullptr;
+  size_t jpg_len = 0;
+  bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
   esp_camera_fb_return(fb);
+
+  if (!converted || !jpg_buf) {
+    if (jpg_buf) {
+      free(jpg_buf);
+    }
+    server.send(500, "text/plain", "Falha ao converter imagem para JPEG");
+    return;
+  }
+
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(jpg_len));
+  server.send_P(200, "image/jpeg", (const char *)jpg_buf, jpg_len);
+  free(jpg_buf);
 }
 
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
-
-  esp_err_t err = esp_camera_init(&config);
-  return (err == ESP_OK);
-}
-
-void startAPConfig() {
-  apMode = true;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-CAM-CONFIG");
-  Serial.println("MODO_CONFIG_AP: Conecte no WiFi ESP32-CAM-CONFIG e abra http://192.168.4.1");
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(800);
-
-  camOk = initCamera();
-  Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
-
-  prefs.begin("wifi_cfg", true);
-  savedSsid = prefs.getString("ssid", "");
-  savedPass = prefs.getString("pass", "");
-  prefs.end();
-
-  if (savedSsid.length() > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-    Serial.print("Conectando em " + savedSsid);
-    int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 30) {
-      delay(500);
-      Serial.print(".");
-      tentativas++;
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("WIFI_OK IP: ");
-      Serial.println(WiFi.localIP());
-    } else {
-      Serial.println("WIFI_FAIL -> Abrindo AP de configuracao");
-      startAPConfig();
-    }
-  } else {
-    startAPConfig();
-  }
-
-  server.on("/", handleRoot);
-  server.on("/config", handleConfig);
-  server.on("/salvar", HTTP_POST, handleSalvar);
-  server.on("/foto", handleFoto);
-  server.begin();
-}
-
-void loop() {
-  server.handleClient();
-}
+  config.ledc_timer   = LEDC_TIMER
