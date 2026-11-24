@@ -32,10 +32,10 @@ static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.fire
 
 // Parametros de espera leve e deteccao de movimento
 static const unsigned long IDLE_CHECK_INTERVAL_MS = 450;   // Espera leve sem envio quando parado
-static const unsigned long ACTIVE_SEND_INTERVAL_MS = 350; // Ritmo ativo (~3 FPS) quando ha movimento
-static const unsigned long MOTION_HOLD_MS = 4000;         // Continua enviando por 4s apos ultimo movimento
+static const unsigned long ACTIVE_SEND_INTERVAL_MS = 450; // Margem segura de memoria/rede sem PSRAM
+static const unsigned long MOTION_HOLD_MS = 4000;         // Continua ativo por 4s apos movimento
 static const float MOTION_DIFF_THRESHOLD = 0.08f;         // 8% de diferenca media entre quadros
-static const uint8_t JPEG_ENCODE_QUALITY = 10;            // Qualidade JPEG refinada sobre RGB565
+static const uint8_t JPEG_ENCODE_QUALITY = 12;            // Qualidade JPEG equilibrada para DRAM
 
 WebServer server(80);
 Preferences prefs;
@@ -51,7 +51,40 @@ unsigned long lastCamCheckMs = 0;
 unsigned long lastFirebaseSendMs = 0;
 unsigned long motionUntilMs = 0;
 
-String encodeBase64Jpeg(const uint8_t* data, size_t len) {
+struct JpegChunkCollector {
+  uint8_t* buf = nullptr;
+  size_t len = 0;
+  size_t cap = 0;
+  bool failed = false;
+};
+
+static size_t onJpegChunk(void* arg, size_t index, const void* data, size_t len) {
+  auto* ctx = static_cast<JpegChunkCollector*>(arg);
+  if (!ctx || ctx->failed || !data || len == 0) return 0;
+
+  size_t needed = index + len;
+  if (needed > ctx->cap) {
+    size_t newCap = ctx->cap ? ctx->cap : 4096;
+    while (newCap < needed) {
+      newCap = (newCap * 3) / 2;
+    }
+    uint8_t* newBuf = static_cast<uint8_t*>(realloc(ctx->buf, newCap));
+    if (!newBuf) {
+      ctx->failed = true;
+      return 0;
+    }
+    ctx->buf = newBuf;
+    ctx->cap = newCap;
+  }
+
+  memcpy(ctx->buf + index, data, len);
+  if (needed > ctx->len) {
+    ctx->len = needed;
+  }
+  return len;
+}
+
+String encodeBase64DataUrl(const uint8_t* data, size_t len) {
   size_t outLen = 0;
   mbedtls_base64_encode(nullptr, 0, &outLen, data, len);
   if (outLen == 0) return "";
@@ -122,26 +155,40 @@ bool sendFrameToFirebase(camera_fb_t* fb) {
     return false;
   }
 
-  uint8_t* jpgBuf = nullptr;
-  size_t jpgLen = 0;
-  if (!frame2jpg(fb, JPEG_ENCODE_QUALITY, &jpgBuf, &jpgLen) || !jpgBuf || jpgLen == 0) {
-    if (jpgBuf) free(jpgBuf);
+  JpegChunkCollector jpg;
+  bool ok = fmt2jpg_cb(
+    fb->buf,
+    fb->len,
+    fb->width,
+    fb->height,
+    fb->format,
+    JPEG_ENCODE_QUALITY,
+    onJpegChunk,
+    &jpg
+  );
+
+  if (!ok || jpg.failed || !jpg.buf || jpg.len == 0) {
+    free(jpg.buf);
     return false;
   }
 
-  String base64Img = encodeBase64Jpeg(jpgBuf, jpgLen);
-  free(jpgBuf);
+  String base64Img = encodeBase64DataUrl(jpg.buf, jpg.len);
+  free(jpg.buf);
+  jpg.buf = nullptr;
 
   if (base64Img.length() == 0) {
     return false;
   }
 
-  JsonDocument doc;
-  doc["imagem"] = base64Img;
-  doc["timestamp"] = static_cast<uint64_t>(millis());
-
   String payload;
-  serializeJson(doc, payload);
+  payload.reserve(base64Img.length() + 48);
+  payload = "{\"imagem\":\"";
+  payload += base64Img;
+  payload += "\",\"timestamp\":";
+  payload += String(static_cast<uint64_t>(millis()));
+  payload += "}";
+
+  base64Img = "";
 
   WiFiClientSecure client;
   client.setInsecure();
