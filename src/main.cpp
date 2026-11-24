@@ -32,9 +32,10 @@ static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.fire
 
 // Parametros de espera leve e deteccao de movimento
 static const unsigned long IDLE_CHECK_INTERVAL_MS = 450;   // Espera leve sem envio quando parado
-static const unsigned long ACTIVE_SEND_INTERVAL_MS = 400; // Margem para envio em VGA + Base64
+static const unsigned long ACTIVE_SEND_INTERVAL_MS = 350; // Ritmo ativo (~3 FPS) quando ha movimento
 static const unsigned long MOTION_HOLD_MS = 4000;         // Continua enviando por 4s apos ultimo movimento
 static const float MOTION_DIFF_THRESHOLD = 0.08f;         // 8% de diferenca media entre quadros
+static const uint8_t JPEG_ENCODE_QUALITY = 10;            // Qualidade JPEG refinada sobre RGB565
 
 WebServer server(80);
 Preferences prefs;
@@ -87,7 +88,6 @@ String encodeBase64Jpeg(const uint8_t* data, size_t len) {
 bool detectMotion(camera_fb_t* fb) {
   if (!fb || !fb->buf || fb->len < 64) return false;
 
-  // Amostragem espacada para manter baixo custo de CPU e memoria
   const size_t step = (fb->len > 4096) ? (fb->len / 1024) : 4;
   const size_t sampleCount = (fb->len + step - 1) / step;
 
@@ -122,7 +122,16 @@ bool sendFrameToFirebase(camera_fb_t* fb) {
     return false;
   }
 
-  String base64Img = encodeBase64Jpeg(fb->buf, fb->len);
+  uint8_t* jpgBuf = nullptr;
+  size_t jpgLen = 0;
+  if (!frame2jpg(fb, JPEG_ENCODE_QUALITY, &jpgBuf, &jpgLen) || !jpgBuf || jpgLen == 0) {
+    if (jpgBuf) free(jpgBuf);
+    return false;
+  }
+
+  String base64Img = encodeBase64Jpeg(jpgBuf, jpgLen);
+  free(jpgBuf);
+
   if (base64Img.length() == 0) {
     return false;
   }
@@ -227,11 +236,11 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_VGA; // 640x480 para maior nitidez
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12; // Qualidade JPEG mais refinada
+  config.jpeg_quality = JPEG_ENCODE_QUALITY;
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
@@ -241,7 +250,7 @@ bool initCamera() {
 
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    s->set_vflip(s, 1); // Corrige imagem invertida verticalmente
+    s->set_vflip(s, 1);
   }
   return true;
 }
