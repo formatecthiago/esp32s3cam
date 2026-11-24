@@ -55,24 +55,32 @@ String encodeBase64Jpeg(const uint8_t* data, size_t len) {
   mbedtls_base64_encode(nullptr, 0, &outLen, data, len);
   if (outLen == 0) return "";
 
-  String out;
-  out.reserve(outLen + 32);
-  out = "data:image/jpeg;base64,";
+  static const char* PREFIX = "data:image/jpeg;base64,";
+  const size_t prefixLen = strlen(PREFIX);
 
-  size_t prefixLen = out.length();
-  out.resize(prefixLen + outLen);
+  char* b64Buf = static_cast<char*>(malloc(outLen + 1));
+  if (!b64Buf) return "";
 
   size_t written = 0;
   int rc = mbedtls_base64_encode(
-    reinterpret_cast<unsigned char*>(&out[prefixLen]),
+    reinterpret_cast<unsigned char*>(b64Buf),
     outLen,
     &written,
     data,
     len
   );
-  if (rc != 0) return "";
+  if (rc != 0) {
+    free(b64Buf);
+    return "";
+  }
+  b64Buf[written] = '\0';
 
-  out.resize(prefixLen + written);
+  String out;
+  out.reserve(prefixLen + written + 1);
+  out = PREFIX;
+  out += b64Buf;
+
+  free(b64Buf);
   return out;
 }
 
