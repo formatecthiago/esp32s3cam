@@ -1,8 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
 #include "esp_camera.h"
+#include "mbedtls/base64.h"
 
 // Pinos da camera na Freenove ESP32-S3 WROOM
 #define PWDN_GPIO_NUM     -1
@@ -23,6 +27,15 @@
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
+// Configuracao do Firebase Realtime Database
+static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream.json";
+
+// Parametros de espera leve e deteccao de movimento
+static const unsigned long IDLE_CHECK_INTERVAL_MS = 450;   // Espera leve sem envio quando parado
+static const unsigned long ACTIVE_SEND_INTERVAL_MS = 280; // Ritmo ativo (~3-4 FPS) quando ha movimento
+static const unsigned long MOTION_HOLD_MS = 4000;         // Continua enviando por 4s apos ultimo movimento
+static const float MOTION_DIFF_THRESHOLD = 0.08f;         // 8% de diferenca media entre quadros
+
 WebServer server(80);
 Preferences prefs;
 
@@ -31,9 +44,107 @@ bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
 
-String htmlConfigPage(String msg = "") {
+uint8_t* prevSampleBuf = nullptr;
+size_t prevSampleLen = 0;
+unsigned long lastCamCheckMs = 0;
+unsigned long lastFirebaseSendMs = 0;
+unsigned long motionUntilMs = 0;
+
+String encodeBase64Jpeg(const uint8_t* data, size_t len) {
+  size_t outLen = 0;
+  mbedtls_base64_encode(nullptr, 0, &outLen, data, len);
+  if (outLen == 0) return "";
+
+  String out;
+  out.reserve(outLen + 32);
+  out = "data:image/jpeg;base64,";
+
+  size_t prefixLen = out.length();
+  out.resize(prefixLen + outLen);
+
+  size_t written = 0;
+  int rc = mbedtls_base64_encode(
+    reinterpret_cast<unsigned char*>(&out[prefixLen]),
+    outLen,
+    &written,
+    data,
+    len
+  );
+  if (rc != 0) return "";
+
+  out.resize(prefixLen + written);
+  return out;
+}
+
+bool detectMotion(camera_fb_t* fb) {
+  if (!fb || !fb->buf || fb->len < 64) return false;
+
+  // Amostragem espacada para manter baixo custo de CPU e memoria
+  const size_t step = (fb->len > 4096) ? (fb->len / 1024) : 4;
+  const size_t sampleCount = (fb->len + step - 1) / step;
+
+  if (!prevSampleBuf || prevSampleLen != sampleCount) {
+    free(prevSampleBuf);
+    prevSampleBuf = static_cast<uint8_t*>(malloc(sampleCount));
+    prevSampleLen = prevSampleBuf ? sampleCount : 0;
+    if (!prevSampleBuf) return true;
+
+    for (size_t i = 0, idx = 0; i < fb->len && idx < sampleCount; i += step, idx++) {
+      prevSampleBuf[idx] = fb->buf[i];
+    }
+    return false;
+  }
+
+  uint64_t diffSum = 0;
+  size_t compared = 0;
+  for (size_t i = 0, idx = 0; i < fb->len && idx < sampleCount; i += step, idx++) {
+    uint8_t cur = fb->buf[i];
+    diffSum += (cur > prevSampleBuf[idx]) ? (cur - prevSampleBuf[idx]) : (prevSampleBuf[idx] - cur);
+    prevSampleBuf[idx] = cur;
+    compared++;
+  }
+
+  if (compared == 0) return false;
+  float avgDiff = static_cast<float>(diffSum) / (static_cast<float>(compared) * 255.0f);
+  return (avgDiff >= MOTION_DIFF_THRESHOLD);
+}
+
+bool sendFrameToFirebase(camera_fb_t* fb) {
+  if (WiFi.status() != WL_CONNECTED || !fb || !fb->buf || fb->len == 0) {
+    return false;
+  }
+
+  String base64Img = encodeBase64Jpeg(fb->buf, fb->len);
+  if (base64Img.length() == 0) {
+    return false;
+  }
+
+  JsonDocument doc;
+  doc["imagem"] = base64Img;
+  doc["timestamp"] = static_cast<uint64_t>(millis());
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(4000);
+  if (!http.begin(client, FIREBASE_STREAM_URL)) {
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.PUT(payload);
+  http.end();
+
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+String htmlConfigPage(const String& msg = "") {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Configurar Wi-Fi ESP32-S3</title></head>";
+  html += "<title>Configurar Wi-Fi Portaria CAM</title></head>";
   html += "<body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;max-width:420px;margin:auto;'>";
   html += "<h2>Configurar Wi-Fi da Camera</h2>";
   if (msg.length() > 0) {
@@ -56,17 +167,11 @@ void handleRoot() {
   }
 
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Teste ESP32-S3 CAM</title></head>";
+  html += "<title>Portaria CAM ESP32-S3</title></head>";
   html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;'>";
-  html += "<h2>Teste ESP32-S3 CAM</h2>";
+  html += "<h2>Portaria CAM ESP32-S3</h2>";
   html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
-  if (!camOk) {
-    html += "<p style='color:#f66;'>Camera nao iniciou. Confira o encaixe do cabo flat.</p>";
-  } else {
-    html += "<p><button onclick='location.reload()' style='padding:10px 18px;font-size:16px;margin:4px;'>Atualizar Foto</button> ";
-    html += "<a href='/config' style='display:inline-block;padding:10px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:4px;'>Trocar Wi-Fi</a></p>";
-    html += "<img src='/foto' style='max-width:100%;border:2px solid #444;border-radius:8px;'/>";
-  }
+  html += "<p><a href='/config' style='display:inline-block;padding:10px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:4px;'>Trocar Wi-Fi</a></p>";
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -88,35 +193,9 @@ void handleSalvar() {
   prefs.putString("pass", p);
   prefs.end();
 
-  server.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;'><h3>Salvo! Reiniciando a placa para conectar em: " + s + "</h3></body></html>");
+  server.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;'><h3>Salvo! Reiniciando para conectar em: " + s + "</h3></body></html>");
   delay(1500);
   ESP.restart();
-}
-
-void handleFoto() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    server.send(500, "text/plain", "Falha ao capturar foto");
-    return;
-  }
-
-  uint8_t * jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-
-  if (!converted || !jpg_buf) {
-    if (jpg_buf) {
-      free(jpg_buf);
-    }
-    server.send(500, "text/plain", "Falha ao converter imagem para JPEG");
-    return;
-  }
-
-  server.sendHeader("Content-Type", "image/jpeg");
-  server.sendHeader("Content-Length", String(jpg_len));
-  server.send_P(200, "image/jpeg", (const char *)jpg_buf, jpg_len);
-  free(jpg_buf);
 }
 
 bool initCamera() {
@@ -141,14 +220,22 @@ bool initCamera() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size   = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_RGB565;
+  config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12;
+  config.jpeg_quality = 16;
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
-  return (err == ESP_OK);
+  if (err != ESP_OK) {
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, 1); // Corrige imagem invertida verticalmente observada no teste
+  }
+  return true;
 }
 
 void startAPConfig() {
@@ -172,6 +259,7 @@ void setup() {
 
   if (savedSsid.length() > 0) {
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(true);
     WiFi.begin(savedSsid.c_str(), savedPass.c_str());
     Serial.print("Conectando em " + savedSsid);
     int tentativas = 0;
@@ -196,10 +284,43 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
-  server.on("/foto", handleFoto);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+
+  if (!camOk || apMode || WiFi.status() != WL_CONNECTED) {
+    delay(20);
+    return;
+  }
+
+  unsigned long now = millis();
+  bool inMotionWindow = (now <= motionUntilMs);
+  unsigned long checkInterval = inMotionWindow ? ACTIVE_SEND_INTERVAL_MS : IDLE_CHECK_INTERVAL_MS;
+
+  if (now - lastCamCheckMs < checkInterval) {
+    delay(15);
+    return;
+  }
+  lastCamCheckMs = now;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    return;
+  }
+
+  bool motionNow = detectMotion(fb);
+  if (motionNow) {
+    motionUntilMs = now + MOTION_HOLD_MS;
+    inMotionWindow = true;
+  }
+
+  if (inMotionWindow && (now - lastFirebaseSendMs >= ACTIVE_SEND_INTERVAL_MS)) {
+    if (sendFrameToFirebase(fb)) {
+      lastFirebaseSendMs = now;
+    }
+  }
+
+  esp_camera_fb_return(fb);
 }
