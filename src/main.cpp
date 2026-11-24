@@ -174,6 +174,7 @@ bool sendFrameToFirebase(camera_fb_t* fb, const char* modeLabel) {
 
   if (!ok || jpg.failed || !jpg.buf || jpg.len == 0) {
     free(jpg.buf);
+    Serial.println("ERR_JPG_ENCODE");
     return false;
   }
 
@@ -182,6 +183,7 @@ bool sendFrameToFirebase(camera_fb_t* fb, const char* modeLabel) {
   jpg.buf = nullptr;
 
   if (base64Img.length() == 0) {
+    Serial.println("ERR_B64");
     return false;
   }
 
@@ -201,6 +203,7 @@ bool sendFrameToFirebase(camera_fb_t* fb, const char* modeLabel) {
   HTTPClient http;
   http.setTimeout(5000);
   if (!http.begin(client, FIREBASE_STREAM_URL)) {
+    Serial.println("ERR_HTTP_BEGIN");
     return false;
   }
 
@@ -211,8 +214,10 @@ bool sendFrameToFirebase(camera_fb_t* fb, const char* modeLabel) {
   if (httpCode >= 200 && httpCode < 300) {
     totalSentCount++;
     lastSendMode = String(modeLabel);
+    Serial.printf("SEND_OK [%s] #%lu (HTTP %d)\n", modeLabel, totalSentCount, httpCode);
     return true;
   }
+  Serial.printf("ERR_HTTP_%d\n", httpCode);
   return false;
 }
 
@@ -351,11 +356,11 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;
   config.frame_size   = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_location  = CAMERA_FB_IN_DRAM;
   config.jpeg_quality = JPEG_ENCODE_QUALITY;
   config.fb_count     = 1;
 
@@ -366,6 +371,7 @@ bool initCamera() {
 
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
+    s->set_hmirror(s, 1);
     s->set_vflip(s, 1);
   }
   return true;
