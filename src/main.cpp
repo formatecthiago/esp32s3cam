@@ -36,15 +36,11 @@ bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
 String lastResultMsg = "Nenhuma captura enviada ainda.";
-bool hasPreview = false;
 
-String encodeBase64DataUrl(const uint8_t* data, size_t len) {
+String encodeBase64Raw(const uint8_t* data, size_t len) {
   size_t outLen = 0;
   mbedtls_base64_encode(nullptr, 0, &outLen, data, len);
   if (outLen == 0) return "";
-
-  static const char* PREFIX = "data:image/jpeg;base64,";
-  const size_t prefixLen = strlen(PREFIX);
 
   char* b64Buf = static_cast<char*>(malloc(outLen + 1));
   if (!b64Buf) return "";
@@ -64,10 +60,8 @@ String encodeBase64DataUrl(const uint8_t* data, size_t len) {
   b64Buf[written] = '\0';
 
   String out;
-  out.reserve(prefixLen + written + 1);
-  out = PREFIX;
-  out += b64Buf;
-
+  out.reserve(written + 1);
+  out = b64Buf;
   free(b64Buf);
   return out;
 }
@@ -92,9 +86,9 @@ String htmlConfigPage(const String& msg = "") {
 
 String htmlMainPage() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Teste 1 Foto - Firebase</title></head>";
+  html += "<title>Envio Bruto - Firebase</title></head>";
   html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:18px;max-width:440px;margin:auto;'>";
-  html += "<h2>Teste 1 Foto - Firebase</h2>";
+  html += "<h2>Envio Frame Bruto (RGB565)</h2>";
   html += "<p style='color:#aaa;font-size:14px;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
   html += "<p style='background:#1c1c1c;padding:10px;border-radius:6px;font-size:14px;'>" + lastResultMsg + "</p>";
 
@@ -102,14 +96,8 @@ String htmlMainPage() {
     html += "<p style='color:#f66;'>Camera nao iniciou. Confira o cabo flat.</p>";
   } else {
     html += "<form action='/start' method='POST' style='margin:14px 0;'>";
-    html += "<button type='submit' style='width:100%;padding:14px;font-size:18px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:8px;cursor:pointer;'>START (Capturar e Enviar 1 Foto)</button>";
+    html += "<button type='submit' style='width:100%;padding:14px;font-size:18px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:8px;cursor:pointer;'>START (Enviar Frame Bruto)</button>";
     html += "</form>";
-
-    if (hasPreview) {
-      html += "<div style='margin-top:12px;'>";
-      html += "<img src='/foto?t=" + String(millis()) + "' style='max-width:100%;border:2px solid #444;border-radius:8px;'/>";
-      html += "</div>";
-    }
   }
 
   html += "<p style='margin-top:16px;'><a href='/config' style='display:inline-block;padding:8px 14px;background:#2a2a2a;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
@@ -125,90 +113,54 @@ void handleRoot() {
   server.send(200, "text/html", htmlMainPage());
 }
 
-void handleFoto() {
-  if (!camOk) {
-    server.send(500, "text/plain", "Camera indisponivel");
-    return;
-  }
-
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    server.send(500, "text/plain", "Falha ao capturar foto");
-    return;
-  }
-
-  uint8_t* jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-
-  if (!converted || !jpg_buf) {
-    free(jpg_buf);
-    server.send(500, "text/plain", "Falha ao converter JPEG");
-    return;
-  }
-
-  server.sendHeader("Content-Type", "image/jpeg");
-  server.sendHeader("Content-Length", String(jpg_len));
-  server.send_P(200, "image/jpeg", (const char*)jpg_buf, jpg_len);
-  free(jpg_buf);
-}
-
 void handleStart() {
   if (apMode || !camOk) {
     server.send(200, "text/html", htmlMainPage());
     return;
   }
 
-  Serial.println("=== INICIANDO TESTE DE 1 FOTO ===");
-  Serial.printf("Heap livre antes da captura: %u bytes\n", ESP.getFreeHeap());
+  Serial.println("=== INICIANDO ENVIO BRUTO ===");
+  Serial.printf("Heap livre antes: %u bytes\n", ESP.getFreeHeap());
 
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
+  if (!fb || !fb->buf || fb->len == 0) {
+    if (fb) esp_camera_fb_return(fb);
     lastResultMsg = "Erro: falha ao capturar frame da camera.";
     Serial.println("ERR_FB_GET");
     server.send(200, "text/html", htmlMainPage());
     return;
   }
 
-  uint8_t* jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+  size_t rawLen = fb->len;
+  uint16_t w = fb->width;
+  uint16_t h = fb->height;
+  String rawB64 = encodeBase64Raw(fb->buf, rawLen);
   esp_camera_fb_return(fb);
   fb = nullptr;
 
-  if (!converted || !jpg_buf || jpg_len == 0) {
-    free(jpg_buf);
-    lastResultMsg = "Erro: falha ao converter frame para JPEG (frame2jpg).";
-    Serial.println("ERR_FRAME2JPG");
-    server.send(200, "text/html", htmlMainPage());
-    return;
-  }
-
-  hasPreview = true;
-  Serial.printf("JPEG OK: %u bytes | Heap livre: %u bytes\n", (unsigned)jpg_len, ESP.getFreeHeap());
-
-  String base64Img = encodeBase64DataUrl(jpg_buf, jpg_len);
-  free(jpg_buf);
-  jpg_buf = nullptr;
-
-  if (base64Img.length() == 0) {
-    lastResultMsg = "Erro: falha ao gerar Base64 (sem RAM suficiente).";
-    Serial.println("ERR_B64_MALLOC");
+  if (rawB64.length() == 0) {
+    lastResultMsg = "Erro: sem RAM para codificar Base64 (" + String(rawLen) + " bytes brutos).";
+    Serial.printf("ERR_B64_MALLOC raw=%u heap=%u\n", (unsigned)rawLen, ESP.getFreeHeap());
     server.send(200, "text/html", htmlMainPage());
     return;
   }
 
   String payload;
-  payload.reserve(base64Img.length() + 48);
-  payload = "{\"imagem\":\"";
-  payload += base64Img;
+  payload.reserve(rawB64.length() + 96);
+  payload = "{\"format\":\"RGB565\",\"width\":";
+  payload += String(w);
+  payload += ",\"height\":";
+  payload += String(h);
+  payload += ",\"bytes\":";
+  payload += String((unsigned)rawLen);
+  payload += ",\"raw_base64\":\"";
+  payload += rawB64;
   payload += "\",\"timestamp\":";
   payload += String(static_cast<uint64_t>(millis()));
   payload += "}";
-  base64Img = "";
+  rawB64 = "";
 
-  Serial.printf("Payload JSON: %u bytes | Heap livre antes HTTPS: %u bytes\n", payload.length(), ESP.getFreeHeap());
+  Serial.printf("Payload bruto: %u bytes | Heap antes HTTPS: %u bytes\n", payload.length(), ESP.getFreeHeap());
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -230,7 +182,7 @@ void handleStart() {
   http.end();
 
   if (httpCode >= 200 && httpCode < 300) {
-    lastResultMsg = "SUCESSO! 1 foto enviada ao Firebase (HTTP " + String(httpCode) + ").";
+    lastResultMsg = "SUCESSO! Frame bruto enviado ao Firebase (HTTP " + String(httpCode) + ").";
     Serial.printf("FIREBASE_OK HTTP %d\n", httpCode);
   } else {
     lastResultMsg = "Falha no Firebase: codigo " + String(httpCode) + " (" + errStr + ")";
@@ -346,7 +298,6 @@ void setup() {
   }
 
   server.on("/", handleRoot);
-  server.on("/foto", handleFoto);
   server.on("/start", HTTP_POST, handleStart);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
