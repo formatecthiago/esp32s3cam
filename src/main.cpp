@@ -32,7 +32,7 @@ static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.fire
 
 // Parametros de espera leve e deteccao de movimento
 static const unsigned long IDLE_CHECK_INTERVAL_MS = 450;   // Espera leve sem envio quando parado
-static const unsigned long ACTIVE_SEND_INTERVAL_MS = 280; // Ritmo ativo (~3-4 FPS) quando ha movimento
+static const unsigned long ACTIVE_SEND_INTERVAL_MS = 400; // Margem para envio em VGA + Base64
 static const unsigned long MOTION_HOLD_MS = 4000;         // Continua enviando por 4s apos ultimo movimento
 static const float MOTION_DIFF_THRESHOLD = 0.08f;         // 8% de diferenca media entre quadros
 
@@ -130,7 +130,7 @@ bool sendFrameToFirebase(camera_fb_t* fb) {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(4000);
+  http.setTimeout(5000);
   if (!http.begin(client, FIREBASE_STREAM_URL)) {
     return false;
   }
@@ -219,11 +219,11 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_QVGA;
+  config.frame_size   = FRAMESIZE_VGA; // 640x480 para maior nitidez
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 16;
+  config.jpeg_quality = 12; // Qualidade JPEG mais refinada
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
@@ -233,7 +233,7 @@ bool initCamera() {
 
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    s->set_vflip(s, 1); // Corrige imagem invertida verticalmente observada no teste
+    s->set_vflip(s, 1); // Corrige imagem invertida verticalmente
   }
   return true;
 }
