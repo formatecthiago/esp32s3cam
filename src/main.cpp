@@ -4,7 +4,6 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <ArduinoJson.h>
 #include "esp_camera.h"
 #include "mbedtls/base64.h"
 
@@ -30,12 +29,14 @@
 // Configuracao do Firebase Realtime Database
 static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream.json";
 
-// Parametros de espera leve e deteccao de movimento
-static const unsigned long IDLE_CHECK_INTERVAL_MS = 450;   // Espera leve sem envio quando parado
-static const unsigned long ACTIVE_SEND_INTERVAL_MS = 450; // Margem segura de memoria/rede sem PSRAM
-static const unsigned long MOTION_HOLD_MS = 4000;         // Continua ativo por 4s apos movimento
-static const float MOTION_DIFF_THRESHOLD = 0.08f;         // 8% de diferenca media entre quadros
-static const uint8_t JPEG_ENCODE_QUALITY = 12;            // Qualidade JPEG equilibrada para DRAM
+// Tempos e limites da logica de espera e movimento
+static const unsigned long IDLE_CHECK_INTERVAL_MS = 500;    // Checagem leve para detectar movimento
+static const unsigned long IDLE_SEND_INTERVAL_MS = 60000;   // 1 imagem a cada 1 minuto em espera
+static const unsigned long NO_MOTION_TIMEOUT_MS = 60000;    // Volta para espera apos 1 minuto sem movimento
+static const unsigned long MIN_BURST_INTERVAL_MS = 1000;    // Minimo inicial: 1 imagem por segundo (1000 ms)
+static const unsigned long MAX_BURST_INTERVAL_MS = 5000;    // Teto seguro de intervalo configuravel
+static const float MOTION_DIFF_THRESHOLD = 0.08f;           // 8% de diferenca media entre quadros
+static const uint8_t JPEG_ENCODE_QUALITY = 12;              // Qualidade JPEG equilibrada sem PSRAM
 
 WebServer server(80);
 Preferences prefs;
@@ -45,11 +46,15 @@ bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
 
-uint8_t* prevSampleBuf = nullptr;
-size_t prevSampleLen = 0;
+unsigned long burstIntervalMs = MIN_BURST_INTERVAL_MS;
 unsigned long lastCamCheckMs = 0;
 unsigned long lastFirebaseSendMs = 0;
 unsigned long motionUntilMs = 0;
+unsigned long totalSentCount = 0;
+String lastSendMode = "Aguardando";
+
+uint8_t* prevSampleBuf = nullptr;
+size_t prevSampleLen = 0;
 
 struct JpegChunkCollector {
   uint8_t* buf = nullptr;
@@ -150,7 +155,7 @@ bool detectMotion(camera_fb_t* fb) {
   return (avgDiff >= MOTION_DIFF_THRESHOLD);
 }
 
-bool sendFrameToFirebase(camera_fb_t* fb) {
+bool sendFrameToFirebase(camera_fb_t* fb, const char* modeLabel) {
   if (WiFi.status() != WL_CONNECTED || !fb || !fb->buf || fb->len == 0) {
     return false;
   }
@@ -203,7 +208,32 @@ bool sendFrameToFirebase(camera_fb_t* fb) {
   int httpCode = http.PUT(payload);
   http.end();
 
-  return (httpCode >= 200 && httpCode < 300);
+  if (httpCode >= 200 && httpCode < 300) {
+    totalSentCount++;
+    lastSendMode = String(modeLabel);
+    return true;
+  }
+  return false;
+}
+
+void loadSettings() {
+  prefs.begin("cam_cfg", true);
+  unsigned long loaded = prefs.getULong("burst_ms", MIN_BURST_INTERVAL_MS);
+  prefs.end();
+
+  if (loaded < MIN_BURST_INTERVAL_MS) loaded = MIN_BURST_INTERVAL_MS;
+  if (loaded > MAX_BURST_INTERVAL_MS) loaded = MAX_BURST_INTERVAL_MS;
+  burstIntervalMs = loaded;
+}
+
+void saveBurstInterval(unsigned long newIntervalMs) {
+  if (newIntervalMs < MIN_BURST_INTERVAL_MS) newIntervalMs = MIN_BURST_INTERVAL_MS;
+  if (newIntervalMs > MAX_BURST_INTERVAL_MS) newIntervalMs = MAX_BURST_INTERVAL_MS;
+
+  burstIntervalMs = newIntervalMs;
+  prefs.begin("cam_cfg", false);
+  prefs.putULong("burst_ms", burstIntervalMs);
+  prefs.end();
 }
 
 String htmlConfigPage(const String& msg = "") {
@@ -224,20 +254,59 @@ String htmlConfigPage(const String& msg = "") {
   return html;
 }
 
+String htmlMainPage(const String& notice = "") {
+  unsigned long now = millis();
+  bool activeBurst = (now <= motionUntilMs);
+  unsigned long secSinceSend = (lastFirebaseSendMs > 0 && now >= lastFirebaseSendMs) ? ((now - lastFirebaseSendMs) / 1000) : 0;
+  unsigned long remBurstSec = activeBurst ? ((motionUntilMs - now + 999) / 1000) : 0;
+
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Portaria CAM - Ajustes</title></head>";
+  html += "<body style='font-family:sans-serif;background:#111;color:#fff;padding:18px;max-width:440px;margin:auto;'>";
+  html += "<h2>Portaria CAM</h2>";
+  html += "<p style='color:#aaa;font-size:14px;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
+
+  if (notice.length() > 0) {
+    html += "<p style='background:#1f3322;padding:10px;border-left:4px solid #4caf50;font-size:14px;'>" + notice + "</p>";
+  }
+
+  html += "<div style='background:#1c1c1c;padding:12px;border-radius:8px;margin-bottom:16px;font-size:14px;line-height:1.6;'>";
+  html += "<b>Estado atual:</b> " + String(activeBurst ? "Sequencia rapida" : "Espera (1 foto/min)") + "<br>";
+  html += "<b>Intervalo rapido gravado:</b> " + String(burstIntervalMs) + " ms<br>";
+  html += "<b>Retorno a espera:</b> 60 s sem movimento" + String(activeBurst ? (" (restam ~" + String(remBurstSec) + " s)") : "") + "<br>";
+  html += "<b>Ultimo envio:</b> " + lastSendMode + (lastFirebaseSendMs > 0 ? (" (" + String(secSinceSend) + " s atras)") : " (nenhum ainda)") + "<br>";
+  html += "<b>Total enviados:</b> " + String(totalSentCount);
+  html += "</div>";
+
+  html += "<form action='/gravar' method='POST' style='background:#1c1c1c;padding:14px;border-radius:8px;margin-bottom:16px;'>";
+  html += "<label for='interval_ms' style='display:block;margin-bottom:8px;'><b>Intervalo na sequencia rapida (ms):</b></label>";
+  html += "<input id='interval_ms' name='interval_ms' type='number' min='" + String(MIN_BURST_INTERVAL_MS) + "' max='" + String(MAX_BURST_INTERVAL_MS) + "' step='50' value='" + String(burstIntervalMs) + "' style='width:100%;padding:10px;font-size:16px;margin-bottom:8px;'>";
+  html += "<small style='color:#aaa;display:block;margin-bottom:12px;'>1000 ms = 1 foto/seg (minimo inicial). Valores menores aumentam o ritmo.</small>";
+  html += "<button type='submit' style='width:100%;padding:12px;font-size:16px;background:#2e7d32;color:#fff;border:none;border-radius:6px;'>Gravar</button>";
+  html += "</form>";
+
+  html += "<p><a href='/' style='display:inline-block;padding:8px 14px;background:#2a2a2a;color:#fff;text-decoration:none;border-radius:6px;margin-right:8px;'>Atualizar status</a>";
+  html += "<a href='/config' style='display:inline-block;padding:8px 14px;background:#2a2a2a;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
+  html += "</body></html>";
+  return html;
+}
+
 void handleRoot() {
   if (apMode) {
     server.send(200, "text/html", htmlConfigPage("Conectado ao modo de configuracao. Informe o Wi-Fi abaixo."));
     return;
   }
+  server.send(200, "text/html", htmlMainPage());
+}
 
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Portaria CAM ESP32-S3</title></head>";
-  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;'>";
-  html += "<h2>Portaria CAM ESP32-S3</h2>";
-  html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
-  html += "<p><a href='/config' style='display:inline-block;padding:10px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:4px;'>Trocar Wi-Fi</a></p>";
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+void handleGravar() {
+  if (apMode) {
+    server.send(200, "text/html", htmlConfigPage("Configure o Wi-Fi primeiro."));
+    return;
+  }
+  unsigned long val = server.arg("interval_ms").toInt();
+  saveBurstInterval(val);
+  server.send(200, "text/html", htmlMainPage("Intervalo gravado com sucesso: " + String(burstIntervalMs) + " ms."));
 }
 
 void handleConfig() {
@@ -313,6 +382,8 @@ void setup() {
   Serial.begin(115200);
   delay(800);
 
+  loadSettings();
+
   camOk = initCamera();
   Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
 
@@ -346,6 +417,7 @@ void setup() {
   }
 
   server.on("/", handleRoot);
+  server.on("/gravar", HTTP_POST, handleGravar);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
   server.begin();
@@ -360,10 +432,7 @@ void loop() {
   }
 
   unsigned long now = millis();
-  bool inMotionWindow = (now <= motionUntilMs);
-  unsigned long checkInterval = inMotionWindow ? ACTIVE_SEND_INTERVAL_MS : IDLE_CHECK_INTERVAL_MS;
-
-  if (now - lastCamCheckMs < checkInterval) {
+  if (now - lastCamCheckMs < IDLE_CHECK_INTERVAL_MS) {
     delay(15);
     return;
   }
@@ -376,12 +445,27 @@ void loop() {
 
   bool motionNow = detectMotion(fb);
   if (motionNow) {
-    motionUntilMs = now + MOTION_HOLD_MS;
-    inMotionWindow = true;
+    motionUntilMs = now + NO_MOTION_TIMEOUT_MS;
   }
 
-  if (inMotionWindow && (now - lastFirebaseSendMs >= ACTIVE_SEND_INTERVAL_MS)) {
-    if (sendFrameToFirebase(fb)) {
+  bool inMotionWindow = (now <= motionUntilMs);
+  bool shouldSend = false;
+  const char* modeLabel = "Espera 1m";
+
+  if (inMotionWindow) {
+    modeLabel = "Movimento";
+    if (lastFirebaseSendMs == 0 || (now - lastFirebaseSendMs >= burstIntervalMs)) {
+      shouldSend = true;
+    }
+  } else {
+    modeLabel = "Espera 1m";
+    if (lastFirebaseSendMs == 0 || (now - lastFirebaseSendMs >= IDLE_SEND_INTERVAL_MS)) {
+      shouldSend = true;
+    }
+  }
+
+  if (shouldSend) {
+    if (sendFrameToFirebase(fb, modeLabel)) {
       lastFirebaseSendMs = now;
     }
   }
