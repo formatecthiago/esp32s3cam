@@ -39,20 +39,16 @@ static const size_t WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
 
 static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
 
-// Parametros fixos para o teste limpo (320x240 RGB565 em blocos de 16 linhas)
+// 320x240 RGB565 em blocos menores de 8 linhas para aliviar o pico de RAM
 static const framesize_t FRAME_SIZE = FRAMESIZE_QVGA;
 static const int FRAME_W = 320;
 static const int FRAME_H = 240;
-static const int ROWS_PER_CHUNK = 16;
-static const int TARGET_FPS = 1; // 1 = 1 FPS (~1000 ms). Ajuste para 1..4 conforme o teste.
+static const int ROWS_PER_CHUNK = 8;
+static const int TARGET_FPS = 1;
 
 static bool camOk = false;
 static unsigned long frameSeq = 0;
 static unsigned long lastSendMs = 0;
-
-static WiFiClientSecure tlsClient;
-static HTTPClient httpClient;
-static bool httpPronto = false;
 
 static bool initCamera() {
   camera_config_t config;
@@ -100,11 +96,6 @@ static bool conectarWifi() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      tlsClient.setInsecure();
-      tlsClient.setTimeout(7);
-      httpClient.setReuse(true);
-      httpClient.setTimeout(7000);
-      httpPronto = true;
       Serial.print("WIFI_OK: ");
       Serial.println(WIFI_LIST[i].ssid);
       return true;
@@ -115,14 +106,22 @@ static bool conectarWifi() {
   return false;
 }
 
-static bool putJsonReutilizado(const String& url, const String& body) {
-  if (!httpPronto) return false;
-  if (!httpClient.begin(tlsClient, url)) {
-    httpClient.end();
+static bool putJsonLimpo(const String& url, const String& body) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8);
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, url)) {
+    http.end();
     return false;
   }
-  httpClient.addHeader("Content-Type", "application/json");
-  int code = httpClient.PUT(body);
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(body);
+  http.end();
+
   return (code > 0 && code < 300);
 }
 
@@ -146,13 +145,18 @@ static bool enviarBloco(int idx, int r0, int rc, const uint8_t* buf) {
   b64 = "";
 
   String url = String(FIREBASE_STREAM_URL) + "/blocos/" + String(idx) + ".json";
-  bool ok = putJsonReutilizado(url, json);
+  bool ok = putJsonLimpo(url, json);
   json = "";
   return ok;
 }
 
 static void enviarFrameLimpo() {
   if (!camOk || WiFi.status() != WL_CONNECTED) return;
+
+  Serial.print("HEAP_ANTES: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(" MAX_BLK: ");
+  Serial.println(ESP.getMaxAllocHeap());
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -179,6 +183,7 @@ static void enviarFrameLimpo() {
       Serial.println(c);
       break;
     }
+    delay(30);
     yield();
   }
 
@@ -192,7 +197,7 @@ static void enviarFrameLimpo() {
                       ",\"blocos\":" + String(totalBlocos) +
                       ",\"frame\":" + String(frameSeq) +
                       ",\"ts\":" + String(millis()) + "}";
-    if (!putJsonReutilizado(metaUrl, metaJson)) {
+    if (!putJsonLimpo(metaUrl, metaJson)) {
       Serial.println("META_FAIL");
     } else {
       Serial.print("FRAME_OK #");
