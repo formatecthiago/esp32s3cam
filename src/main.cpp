@@ -1,7 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <base64.h>
 #include "esp_camera.h"
 
 // Pinos da camera na Freenove ESP32-S3 WROOM
@@ -23,9 +26,7 @@
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
-static const int IMG_W = 320;
-static const int IMG_H = 240;
-static const size_t EXPECTED_BYTES = IMG_W * IMG_H * 2; // 153600 bytes
+static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream.json";
 
 WebServer server(80);
 Preferences prefs;
@@ -34,6 +35,135 @@ bool camOk = false;
 bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
+framesize_t currentFrameSize = FRAMESIZE_96X96;
+
+// 0 = Manual (1 disparo), 1..4 = FPS alvo
+int targetFps = 0;
+unsigned long lastAutoSendMs = 0;
+String lastStatusMsg = "Pronto.";
+
+int getFrameWidth(framesize_t fs) {
+  switch (fs) {
+    case FRAMESIZE_QQVGA: return 160;
+    case FRAMESIZE_QVGA:  return 320;
+    case FRAMESIZE_96X96:
+    default:              return 96;
+  }
+}
+
+int getFrameHeight(framesize_t fs) {
+  switch (fs) {
+    case FRAMESIZE_QQVGA: return 120;
+    case FRAMESIZE_QVGA:  return 240;
+    case FRAMESIZE_96X96:
+    default:              return 96;
+  }
+}
+
+framesize_t parseFrameSize(const String& val) {
+  if (val == "QQVGA") return FRAMESIZE_QQVGA;
+  if (val == "QVGA")  return FRAMESIZE_QVGA;
+  return FRAMESIZE_96X96;
+}
+
+bool initCameraWithSize(framesize_t fs) {
+  esp_camera_deinit();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 10000000;
+  config.frame_size   = fs;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location  = CAMERA_FB_IN_DRAM;
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err == ESP_OK) {
+    currentFrameSize = fs;
+    return true;
+  }
+  return false;
+}
+
+bool enviarFrameBrutoFirebase(unsigned long* elapsedMsOut, size_t* rawLenOut) {
+  if (!camOk || WiFi.status() != WL_CONNECTED) {
+    lastStatusMsg = "Sem camera ou sem Wi-Fi.";
+    return false;
+  }
+
+  unsigned long t0 = millis();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    lastStatusMsg = "Falha ao capturar frame da camera.";
+    return false;
+  }
+
+  size_t rawLen = fb->len;
+  int w = getFrameWidth(currentFrameSize);
+  int h = getFrameHeight(currentFrameSize);
+
+  String b64 = base64::encode(fb->buf, rawLen);
+  esp_camera_fb_return(fb);
+
+  String payload;
+  payload.reserve(b64.length() + 128);
+  payload += "{\"formato\":\"rgb565\",\"w\":";
+  payload += String(w);
+  payload += ",\"h\":";
+  payload += String(h);
+  payload += ",\"timestamp\":";
+  payload += String((unsigned long)millis());
+  payload += ",\"dados\":\"";
+  payload += b64;
+  payload += "\"}";
+  b64 = "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, FIREBASE_STREAM_URL)) {
+    lastStatusMsg = "Falha ao iniciar conexao HTTPS com Firebase.";
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.PUT(payload);
+  payload = "";
+  http.end();
+
+  unsigned long dt = millis() - t0;
+  if (elapsedMsOut) *elapsedMsOut = dt;
+  if (rawLenOut) *rawLenOut = rawLen;
+
+  if (httpCode > 0 && httpCode < 300) {
+    lastStatusMsg = "Enviado " + String(rawLen) + "B (" + String(w) + "x" + String(h) + ") em " + String(dt) + " ms (HTTP " + String(httpCode) + ")";
+    return true;
+  } else {
+    lastStatusMsg = "Erro Firebase HTTP " + String(httpCode) + " em " + String(dt) + " ms";
+    return false;
+  }
+}
 
 String htmlConfigPage(String msg = "") {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
@@ -60,62 +190,116 @@ void handleRoot() {
   }
 
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Teste ESP32-S3 CAM (320x240)</title></head>";
+  html += "<title>Controle ESP32-S3 -> Firebase</title></head>";
   html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
-  html += "<h2>Teste ESP32-S3 CAM (320x240)</h2>";
+  html += "<h2>ESP32-S3 -> Firebase (Bruto)</h2>";
   html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
+
   if (!camOk) {
-    html += "<p style='color:#f66;'>Camera nao iniciou em 320x240 (sem PSRAM). Confira o monitor serial.</p>";
+    html += "<p style='color:#f66;'>Camera nao iniciou. Confira o cabo flat.</p>";
   } else {
-    html += "<p><button onclick='dispararCaptura()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
-    html += "<a href='/config' style='display:inline-block;padding:12px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
-    html += "<p id='status' style='color:#ccc;'>Pronto. Clique em START para capturar 320x240.</p>";
-    html += "<canvas id='tela' width='" + String(IMG_W) + "' height='" + String(IMG_H) + "' style='display:none;max-width:100%;height:auto;border:2px solid #444;border-radius:8px;margin:10px auto;'></canvas>";
+    html += "<p><label for='resSelect'>Resolucao:</label> ";
+    html += "<select id='resSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
+    html += String("<option value='96X96'") + (currentFrameSize == FRAMESIZE_96X96 ? " selected" : "") + ">96x96 (Leve)</option>";
+    html += String("<option value='QQVGA'") + (currentFrameSize == FRAMESIZE_QQVGA ? " selected" : "") + ">160x120 QQVGA (Medio)</option>";
+    html += String("<option value='QVGA'") + (currentFrameSize == FRAMESIZE_QVGA ? " selected" : "") + ">320x240 QVGA (Pesado)</option>";
+    html += "</select></p>";
+
+    html += "<p><label for='fpsSelect'>Frequencia de envio:</label> ";
+    html += "<select id='fpsSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
+    html += String("<option value='0'") + (targetFps == 0 ? " selected" : "") + ">Manual (1 clique)</option>";
+    html += String("<option value='1'") + (targetFps == 1 ? " selected" : "") + ">1 FPS (1000 ms)</option>";
+    html += String("<option value='2'") + (targetFps == 2 ? " selected" : "") + ">2 FPS (500 ms)</option>";
+    html += String("<option value='3'") + (targetFps == 3 ? " selected" : "") + ">3 FPS (333 ms)</option>";
+    html += String("<option value='4'") + (targetFps == 4 ? " selected" : "") + ">4 FPS (250 ms)</option>";
+    html += "</select></p>";
+
+    html += "<p><button onclick='enviarAgora()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>ENVIAR AGORA</button> ";
+    html += "<button onclick='pararEnvio()' style='padding:12px 16px;font-size:16px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;margin:4px;'>PARAR</button> ";
+    html += "<a href='/config' style='display:inline-block;padding:12px 16px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;margin:4px;'>Wi-Fi</a></p>";
+
+    html += "<p id='status' style='color:#ccc;margin-top:12px;'>" + lastStatusMsg + "</p>";
 
     html += "<script>";
-    html += "const W=" + String(IMG_W) + ", H=" + String(IMG_H) + ", EXP=" + String(EXPECTED_BYTES) + ";";
-    html += "function desenharRGB565(buf){";
-    html += "  const cv=document.getElementById('tela');";
-    html += "  const ctx=cv.getContext('2d');";
-    html += "  const img=ctx.createImageData(W,H);";
-    html += "  const u16=new Uint16Array(buf);";
-    html += "  const out=img.data;";
-    html += "  const n=Math.min(W*H, u16.length);";
-    html += "  for(let i=0;i<n;i++){";
-    html += "    let p=u16[i];";
-    html += "    p=((p&0xff)<<8)|((p>>8)&0xff);";
-    html += "    const r=((p>>11)&0x1f)*255/31;";
-    html += "    const g=((p>>5)&0x3f)*255/63;";
-    html += "    const b=(p&0x1f)*255/31;";
-    html += "    const o=i*4;";
-    html += "    out[o]=r; out[o+1]=g; out[o+2]=b; out[o+3]=255;";
-    html += "  }";
-    html += "  ctx.putImageData(img,0,0);";
-    html += "  cv.style.display='block';";
-    html += "}";
-    html += "async function dispararCaptura(){";
+    html += "let pollTimer=null;";
+    html += "async function aplicarParametros(){";
+    html += "  const tam=document.getElementById('resSelect').value;";
+    html += "  const fps=document.getElementById('fpsSelect').value;";
     html += "  const s=document.getElementById('status');";
-    html += "  const t0=performance.now();";
-    html += "  s.textContent='Capturando 320x240...';";
+    html += "  s.textContent='Aplicando parametros...';";
     html += "  try{";
-    html += "    const r=await fetch('/foto?t='+Date.now(),{cache:'no-store'});";
-    html += "    if(!r.ok){s.textContent='Erro HTTP '+r.status;return;}";
-    html += "    const buf=await r.arrayBuffer();";
-    html += "    const dt=Math.round(performance.now()-t0);";
-    html += "    if(buf.byteLength < EXP){";
-    html += "      s.textContent='Incompleto: '+buf.byteLength+' de '+EXP+' bytes ('+dt+' ms) - sem memoria para 320x240 inteiro';";
-    html += "      return;";
-    html += "    }";
-    html += "    desenharRGB565(buf);";
-    html += "    s.textContent='Imagem: '+buf.byteLength+' bytes (320x240) | Tempo: '+dt+' ms';";
+    html += "    const r=await fetch('/parametros?tam='+encodeURIComponent(tam)+'&fps='+encodeURIComponent(fps),{cache:'no-store'});";
+    html += "    const d=await r.json();";
+    html += "    s.textContent=d.msg||'Parametros atualizados';";
+    html += "    gerenciarPoll(parseInt(fps,10));";
     html += "  }catch(e){";
-    html += "    s.textContent='Falha ao carregar imagem';";
+    html += "    s.textContent='Falha ao atualizar parametros';";
     html += "  }";
     html += "}";
+    html += "async function enviarAgora(){";
+    html += "  const s=document.getElementById('status');";
+    html += "  s.textContent='Enviando frame bruto ao Firebase...';";
+    html += "  try{";
+    html += "    const r=await fetch('/enviar?t='+Date.now(),{cache:'no-store'});";
+    html += "    const d=await r.json();";
+    html += "    s.textContent=d.msg||'Concluido';";
+    html += "  }catch(e){";
+    html += "    s.textContent='Falha na requisicao de envio';";
+    html += "  }";
+    html += "}";
+    html += "async function pararEnvio(){";
+    html += "  document.getElementById('fpsSelect').value='0';";
+    html += "  await aplicarParametros();";
+    html += "}";
+    html += "function gerenciarPoll(fps){";
+    html += "  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}";
+    html += "  if(fps>0){";
+    html += "    const ms=Math.max(250, Math.round(1000/fps));";
+    html += "    pollTimer=setInterval(async()=>{";
+    html += "      try{const r=await fetch('/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();if(d.msg)document.getElementById('status').textContent=d.msg;}catch(e){}";
+    html += "    }, ms);";
+    html += "  }";
+    html += "}";
+    html += "gerenciarPoll(" + String(targetFps) + ");";
     html += "</script>";
   }
+
   html += "</body></html>";
   server.send(200, "text/html", html);
+}
+
+void handleParametros() {
+  framesize_t fs = parseFrameSize(server.arg("tam"));
+  int fps = server.arg("fps").toInt();
+  if (fps < 0) fps = 0;
+  if (fps > 4) fps = 4;
+
+  bool camReady = true;
+  if (fs != currentFrameSize) {
+    camReady = initCameraWithSize(fs);
+    camOk = camReady;
+  }
+
+  targetFps = fps;
+  lastAutoSendMs = 0;
+
+  String msg = camReady
+    ? ("Resolucao " + String(getFrameWidth(currentFrameSize)) + "x" + String(getFrameHeight(currentFrameSize)) + " | Frequencia: " + (targetFps == 0 ? String("Manual") : (String(targetFps) + " FPS")))
+    : "Falha ao alocar resolucao na camera sem PSRAM.";
+
+  lastStatusMsg = msg;
+  server.send(200, "application/json", "{\"ok\":" + String(camReady ? "true" : "false") + ",\"msg\":\"" + msg + "\"}");
+}
+
+void handleEnviar() {
+  unsigned long dt = 0;
+  size_t rawLen = 0;
+  bool ok = enviarFrameBrutoFirebase(&dt, &rawLen);
+  server.send(ok ? 200 : 500, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + lastStatusMsg + "\"}");
+}
+
+void handleStatus() {
+  server.send(200, "application/json", "{\"msg\":\"" + lastStatusMsg + "\"}");
 }
 
 void handleConfig() {
@@ -140,50 +324,6 @@ void handleSalvar() {
   ESP.restart();
 }
 
-void handleFoto() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) {
-    server.send(500, "text/plain", "Falha ao capturar foto");
-    return;
-  }
-  server.sendHeader("Content-Type", "application/octet-stream");
-  server.sendHeader("Content-Length", String(fb->len));
-  server.send_P(200, "application/octet-stream", (const char *)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-}
-
-bool initCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
-  config.frame_size   = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_RGB565;
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
-
-  esp_err_t err = esp_camera_init(&config);
-  return (err == ESP_OK);
-}
-
 void startAPConfig() {
   apMode = true;
   WiFi.mode(WIFI_AP);
@@ -195,8 +335,8 @@ void setup() {
   Serial.begin(115200);
   delay(800);
 
-  camOk = initCamera();
-  Serial.println(camOk ? "CAM_OK_QVGA" : "CAM_FAIL_QVGA");
+  camOk = initCameraWithSize(currentFrameSize);
+  Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
 
   prefs.begin("wifi_cfg", true);
   savedSsid = prefs.getString("ssid", "");
@@ -227,12 +367,23 @@ void setup() {
   }
 
   server.on("/", handleRoot);
+  server.on("/parametros", handleParametros);
+  server.on("/enviar", handleEnviar);
+  server.on("/status", handleStatus);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
-  server.on("/foto", handleFoto);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+
+  if (!apMode && camOk && targetFps > 0 && WiFi.status() == WL_CONNECTED) {
+    unsigned long intervaloMs = 1000UL / (unsigned long)targetFps;
+    unsigned long agora = millis();
+    if (lastAutoSendMs == 0 || (agora - lastAutoSendMs) >= intervaloMs) {
+      lastAutoSendMs = agora;
+      enviarFrameBrutoFirebase(nullptr, nullptr);
+    }
+  }
 }
