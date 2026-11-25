@@ -63,10 +63,10 @@ void handleRoot() {
   if (!camOk) {
     html += "<p style='color:#f66;'>Camera nao iniciou. Confira o encaixe do cabo flat.</p>";
   } else {
-    html += "<p><button onclick='carregarFoto()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
+    html += "<p><button onclick='dispararCaptura()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
     html += "<a href='/config' style='display:inline-block;padding:12px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
-    html += "<img id='foto' src='' style='display:none;max-width:100%;border:2px solid #444;border-radius:8px;margin-top:10px;'/>";
-    html += "<script>function carregarFoto(){const i=document.getElementById('foto');i.style.display='inline-block';i.src='/foto?t='+Date.now();}</script>";
+    html += "<p id='status' style='color:#ccc;'>Pronto. Clique em START para capturar 1 quadro bruto.</p>";
+    html += "<script>function dispararCaptura(){const s=document.getElementById('status');s.textContent='Capturando...';fetch('/foto?t='+Date.now()).then(r=>r.blob()).then(b=>{s.textContent='Capturado: '+b.size+' bytes (RGB565 bruto)';}).catch(()=>{s.textContent='Falha ao capturar';});}</script>";
   }
   html += "</body></html>";
   server.send(200, "text/html", html);
@@ -100,9 +100,9 @@ void handleFoto() {
     server.send(500, "text/plain", "Falha ao capturar foto");
     return;
   }
-  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Type", "application/octet-stream");
   server.sendHeader("Content-Length", String(fb->len));
-  server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  server.send_P(200, "application/octet-stream", (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
 }
 
@@ -128,9 +128,9 @@ bool initCamera() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size   = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.fb_location  = CAMERA_FB_IN_DRAM;
   config.jpeg_quality = 12;
   config.fb_count     = 1;
 
