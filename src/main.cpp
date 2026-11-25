@@ -23,9 +23,6 @@
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
-static const int IMG_W = 96;
-static const int IMG_H = 96;
-
 WebServer server(80);
 Preferences prefs;
 
@@ -33,6 +30,42 @@ bool camOk = false;
 bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
+framesize_t currentFrameSize = FRAMESIZE_96X96;
+
+int getFrameWidth(framesize_t fs) {
+  switch (fs) {
+    case FRAMESIZE_QQVGA: return 160;
+    case FRAMESIZE_QVGA:  return 320;
+    case FRAMESIZE_96X96:
+    default:              return 96;
+  }
+}
+
+int getFrameHeight(framesize_t fs) {
+  switch (fs) {
+    case FRAMESIZE_QQVGA: return 120;
+    case FRAMESIZE_QVGA:  return 240;
+    case FRAMESIZE_96X96:
+    default:              return 96;
+  }
+}
+
+framesize_t parseFrameSize(const String& val) {
+  if (val == "QQVGA") return FRAMESIZE_QQVGA;
+  if (val == "QVGA")  return FRAMESIZE_QVGA;
+  return FRAMESIZE_96X96;
+}
+
+bool applyFrameSize(framesize_t fs) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+  int res = s->set_framesize(s, fs);
+  if (res == 0) {
+    currentFrameSize = fs;
+    return true;
+  }
+  return false;
+}
 
 String htmlConfigPage(String msg = "") {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
@@ -58,6 +91,9 @@ void handleRoot() {
     return;
   }
 
+  int w = getFrameWidth(currentFrameSize);
+  int h = getFrameHeight(currentFrameSize);
+
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>Teste ESP32-S3 CAM</title></head>";
   html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
@@ -66,19 +102,44 @@ void handleRoot() {
   if (!camOk) {
     html += "<p style='color:#f66;'>Camera nao iniciou. Confira o encaixe do cabo flat.</p>";
   } else {
+    html += "<p><label for='resSelect'>Resolucao:</label> ";
+    html += "<select id='resSelect' onchange='trocarResolucao()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
+    html += String("<option value='96X96'") + (currentFrameSize == FRAMESIZE_96X96 ? " selected" : "") + ">96x96 (Leve)</option>";
+    html += String("<option value='QQVGA'") + (currentFrameSize == FRAMESIZE_QQVGA ? " selected" : "") + ">160x120 QQVGA (Medio)</option>";
+    html += String("<option value='QVGA'") + (currentFrameSize == FRAMESIZE_QVGA ? " selected" : "") + ">320x240 QVGA (Pesado)</option>";
+    html += "</select></p>";
+
     html += "<p><button onclick='dispararCaptura()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
     html += "<a href='/config' style='display:inline-block;padding:12px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
-    html += "<p id='status' style='color:#ccc;'>Pronto. Clique em START para ver a imagem.</p>";
-    html += "<canvas id='tela' width='" + String(IMG_W) + "' height='" + String(IMG_H) + "' style='display:none;width:288px;height:288px;image-rendering:pixelated;border:2px solid #444;border-radius:8px;margin:10px auto;'></canvas>";
+
+    html += "<p id='status' style='color:#ccc;'>Pronto. Escolha a resolucao e clique em START.</p>";
+    html += "<canvas id='tela' width='" + String(w) + "' height='" + String(h) + "' style='display:none;max-width:100%;height:auto;border:2px solid #444;border-radius:8px;margin:10px auto;'></canvas>";
+
     html += "<script>";
-    html += "const W=" + String(IMG_W) + ", H=" + String(IMG_H) + ";";
+    html += "let curW=" + String(w) + ", curH=" + String(h) + ";";
+    html += "async function trocarResolucao(){";
+    html += "  const sel=document.getElementById('resSelect');";
+    html += "  const s=document.getElementById('status');";
+    html += "  s.textContent='Aplicando resolucao '+sel.value+'...';";
+    html += "  try{";
+    html += "    const r=await fetch('/resolucao?tam='+encodeURIComponent(sel.value),{cache:'no-store'});";
+    html += "    if(!r.ok){s.textContent='Erro ao trocar resolucao';return;}";
+    html += "    const d=await r.json();";
+    html += "    curW=d.w; curH=d.h;";
+    html += "    const cv=document.getElementById('tela');";
+    html += "    cv.width=curW; cv.height=curH;";
+    html += "    s.textContent='Resolucao: '+curW+'x'+curH+' ('+d.bytes+' bytes). Clique em START.';";
+    html += "  }catch(e){";
+    html += "    s.textContent='Falha ao aplicar resolucao';";
+    html += "  }";
+    html += "}";
     html += "function desenharRGB565(buf){";
     html += "  const cv=document.getElementById('tela');";
     html += "  const ctx=cv.getContext('2d');";
-    html += "  const img=ctx.createImageData(W,H);";
+    html += "  const img=ctx.createImageData(curW,curH);";
     html += "  const u16=new Uint16Array(buf);";
     html += "  const out=img.data;";
-    html += "  const n=Math.min(W*H, u16.length);";
+    html += "  const n=Math.min(curW*curH, u16.length);";
     html += "  for(let i=0;i<n;i++){";
     html += "    let p=u16[i];";
     html += "    p=((p&0xff)<<8)|((p>>8)&0xff);";
@@ -101,7 +162,7 @@ void handleRoot() {
     html += "    const buf=await r.arrayBuffer();";
     html += "    desenharRGB565(buf);";
     html += "    const dt=Math.round(performance.now()-t0);";
-    html += "    s.textContent='Imagem: '+buf.byteLength+' bytes | Tempo: '+dt+' ms';";
+    html += "    s.textContent='Imagem: '+buf.byteLength+' bytes ('+curW+'x'+curH+') | Tempo: '+dt+' ms';";
     html += "  }catch(e){";
     html += "    s.textContent='Falha ao carregar imagem';";
     html += "  }";
@@ -110,6 +171,20 @@ void handleRoot() {
   }
   html += "</body></html>";
   server.send(200, "text/html", html);
+}
+
+void handleResolucao() {
+  if (!camOk) {
+    server.send(500, "application/json", "{\"ok\":false}");
+    return;
+  }
+  framesize_t target = parseFrameSize(server.arg("tam"));
+  bool ok = applyFrameSize(target);
+  int w = getFrameWidth(currentFrameSize);
+  int h = getFrameHeight(currentFrameSize);
+  int bytesEsperados = w * h * 2;
+  String json = "{\"ok\":" + String(ok ? "true" : "false") + ",\"w\":" + String(w) + ",\"h\":" + String(h) + ",\"bytes\":" + String(bytesEsperados) + "}";
+  server.send(ok ? 200 : 500, "application/json", json);
 }
 
 void handleConfig() {
@@ -167,7 +242,7 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_96X96;
+  config.frame_size   = currentFrameSize;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_DRAM;
@@ -221,6 +296,7 @@ void setup() {
   }
 
   server.on("/", handleRoot);
+  server.on("/resolucao", handleResolucao);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
   server.on("/foto", handleFoto);
