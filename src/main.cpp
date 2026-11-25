@@ -31,7 +31,7 @@ bool apMode = false;
 String savedSsid = "";
 String savedPass = "";
 
-String htmlConfigPage(const String& msg = "") {
+String htmlConfigPage(String msg = "") {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>Configurar Wi-Fi ESP32-S3</title></head>";
   html += "<body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;max-width:420px;margin:auto;'>";
@@ -49,99 +49,27 @@ String htmlConfigPage(const String& msg = "") {
   return html;
 }
 
-String htmlLivePage() {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Teste Tempo Real QQVGA</title></head>";
-  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
-  html += "<h2>Teste Tempo Real (QQVGA)</h2>";
-  html += "<p style='color:#aaa;font-size:13px;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
-
-  if (!camOk) {
-    html += "<p style='color:#f66;'>Camera nao iniciou. Confira o cabo flat.</p>";
-  } else {
-    html += "<button id='btnStart' onclick='toggleLive()' style='width:100%;padding:14px;font-size:18px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:8px;cursor:pointer;'>START</button>";
-    html += "<div id='info' style='background:#1c1c1c;padding:10px;border-radius:6px;margin:12px 0;font-size:14px;'>Parado. Toque em START para ver o tempo real.</div>";
-    html += "<img id='camImg' alt='Preview' style='width:100%;max-width:320px;border:2px solid #444;border-radius:8px;display:none;'/>";
-    html += "<script>";
-    html += "let running=false, t0=0, count=0;";
-    html += "const img=document.getElementById('camImg');";
-    html += "const btn=document.getElementById('btnStart');";
-    html += "const info=document.getElementById('info');";
-    html += "function nextFrame(){";
-    html += "  if(!running) return;";
-    html += "  t0=performance.now();";
-    html += "  img.src='/foto?t='+Date.now();";
-    html += "}";
-    html += "img.onload=function(){";
-    html += "  if(!running) return;";
-    html += "  count++;";
-    html += "  const dt=Math.round(performance.now()-t0);";
-    html += "  info.textContent='Quadro #'+count+' | Tempo: '+dt+' ms (~'+(1000/Math.max(dt,1)).toFixed(1)+' FPS)';";
-    html += "  setTimeout(nextFrame, 30);";
-    html += "};";
-    html += "img.onerror=function(){";
-    html += "  if(!running) return;";
-    html += "  info.textContent='Falha ao carregar quadro. Tentando novamente...';";
-    html += "  setTimeout(nextFrame, 300);";
-    html += "};";
-    html += "function toggleLive(){";
-    html += "  running=!running;";
-    html += "  if(running){";
-    html += "    count=0;";
-    html += "    btn.textContent='STOP';";
-    html += "    btn.style.background='#c62828';";
-    html += "    img.style.display='inline-block';";
-    html += "    info.textContent='Iniciando...';";
-    html += "    nextFrame();";
-    html += "  } else {";
-    html += "    btn.textContent='START';";
-    html += "    btn.style.background='#2e7d32';";
-    html += "    info.textContent='Pausado ('+count+' quadros).';";
-    html += "  }";
-    html += "}";
-    html += "</script>";
-  }
-
-  html += "<p style='margin-top:16px;'><a href='/config' style='display:inline-block;padding:8px 14px;background:#2a2a2a;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
-  html += "</body></html>";
-  return html;
-}
-
 void handleRoot() {
   if (apMode) {
     server.send(200, "text/html", htmlConfigPage("Conectado ao modo de configuracao. Informe o Wi-Fi abaixo."));
     return;
   }
-  server.send(200, "text/html", htmlLivePage());
-}
 
-void handleFoto() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Teste ESP32-S3 CAM</title></head>";
+  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;'>";
+  html += "<h2>Teste ESP32-S3 CAM</h2>";
+  html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
   if (!camOk) {
-    server.send(500, "text/plain", "Camera indisponivel");
-    return;
+    html += "<p style='color:#f66;'>Camera nao iniciou. Confira o encaixe do cabo flat.</p>";
+  } else {
+    html += "<p><button onclick='carregarFoto()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
+    html += "<a href='/config' style='display:inline-block;padding:12px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
+    html += "<img id='foto' src='' style='display:none;max-width:100%;border:2px solid #444;border-radius:8px;margin-top:10px;'/>";
+    html += "<script>function carregarFoto(){const i=document.getElementById('foto');i.style.display='inline-block';i.src='/foto?t='+Date.now();}</script>";
   }
-
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    server.send(500, "text/plain", "Falha ao capturar foto");
-    return;
-  }
-
-  uint8_t* jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  bool converted = frame2jpg(fb, 75, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-
-  if (!converted || !jpg_buf || jpg_len == 0) {
-    free(jpg_buf);
-    Serial.printf("ERR_JPG_QQVGA heap=%u\n", ESP.getFreeHeap());
-    server.send(500, "text/plain", "Falha ao converter JPEG");
-    return;
-  }
-
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "image/jpeg", (const char*)jpg_buf, jpg_len);
-  free(jpg_buf);
+  html += "</body></html>";
+  server.send(200, "text/html", html);
 }
 
 void handleConfig() {
@@ -161,9 +89,21 @@ void handleSalvar() {
   prefs.putString("pass", p);
   prefs.end();
 
-  server.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;'><h3>Salvo! Reiniciando para conectar em: " + s + "</h3></body></html>");
+  server.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;'><h3>Salvo! Reiniciando a placa para conectar em: " + s + "</h3></body></html>");
   delay(1500);
   ESP.restart();
+}
+
+void handleFoto() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Falha ao capturar foto");
+    return;
+  }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
 }
 
 bool initCamera() {
@@ -186,25 +126,16 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
-  config.frame_size   = FRAMESIZE_QQVGA;
-  config.pixel_format = PIXFORMAT_RGB565;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_DRAM;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    return false;
-  }
-
-  sensor_t* s = esp_camera_sensor_get();
-  if (s) {
-    s->set_hmirror(s, 1);
-    s->set_vflip(s, 1);
-  }
-  return true;
+  return (err == ESP_OK);
 }
 
 void startAPConfig() {
@@ -250,9 +181,9 @@ void setup() {
   }
 
   server.on("/", handleRoot);
-  server.on("/foto", handleFoto);
   server.on("/config", handleConfig);
   server.on("/salvar", HTTP_POST, handleSalvar);
+  server.on("/foto", handleFoto);
   server.begin();
 }
 
