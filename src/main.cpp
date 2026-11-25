@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <base64.h>
@@ -30,7 +29,7 @@ struct WifiCred {
   const char* pass;
 };
 
-// Redes Wi-Fi pre-definidas (tenta da primeira para a ultima)
+// Redes Wi-Fi pre-definidas (tenta em sequencia)
 static const WifiCred WIFI_LIST[] = {
   {"FORMATEC 2G", "1234cinco@#"},
   {"NewHome",     "1234cinco@#"},
@@ -38,48 +37,24 @@ static const WifiCred WIFI_LIST[] = {
 };
 static const size_t WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
 
-static const char* FIREBASE_BASE_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
+static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
 
-// 24 linhas por bloco em 320x240 RGB565: 24 * 320 * 2 = 15360 bytes crus (~20480 chars Base64)
-static const int ROWS_PER_CHUNK = 24;
+// Parametros fixos para o teste limpo (320x240 RGB565 em blocos de 16 linhas)
+static const framesize_t FRAME_SIZE = FRAMESIZE_QVGA;
+static const int FRAME_W = 320;
+static const int FRAME_H = 240;
+static const int ROWS_PER_CHUNK = 16;
+static const int TARGET_FPS = 1; // 1 = 1 FPS (~1000 ms). Ajuste para 1..4 conforme o teste.
 
-WebServer server(80);
+static bool camOk = false;
+static unsigned long frameSeq = 0;
+static unsigned long lastSendMs = 0;
 
-bool camOk = false;
-framesize_t currentFrameSize = FRAMESIZE_QVGA; // Padrao 320x240
-int targetFps = 0; // 0 = Manual, 1..4 = FPS
-unsigned long lastAutoSendMs = 0;
-unsigned long frameSeq = 0;
-String activeSsid = "";
-String lastStatusMsg = "Pronto em 320x240.";
+static WiFiClientSecure tlsClient;
+static HTTPClient httpClient;
+static bool httpPronto = false;
 
-int getFrameWidth(framesize_t fs) {
-  switch (fs) {
-    case FRAMESIZE_96X96: return 96;
-    case FRAMESIZE_QQVGA: return 160;
-    case FRAMESIZE_QVGA:
-    default:              return 320;
-  }
-}
-
-int getFrameHeight(framesize_t fs) {
-  switch (fs) {
-    case FRAMESIZE_96X96: return 96;
-    case FRAMESIZE_QQVGA: return 120;
-    case FRAMESIZE_QVGA:
-    default:              return 240;
-  }
-}
-
-framesize_t parseFrameSize(const String& val) {
-  if (val == "96X96") return FRAMESIZE_96X96;
-  if (val == "QQVGA") return FRAMESIZE_QQVGA;
-  return FRAMESIZE_QVGA;
-}
-
-bool initCameraWithSize(framesize_t fs) {
-  esp_camera_deinit();
-
+static bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -100,286 +75,155 @@ bool initCameraWithSize(framesize_t fs) {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;
-  config.frame_size   = fs;
+  config.frame_size   = FRAME_SIZE;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_DRAM;
   config.fb_count     = 1;
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err == ESP_OK) {
-    currentFrameSize = fs;
-    return true;
+  return (esp_camera_init(&config) == ESP_OK);
+}
+
+static bool conectarWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  for (size_t i = 0; i < WIFI_COUNT; i++) {
+    WiFi.disconnect(true);
+    delay(150);
+    WiFi.begin(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
+
+    int tentativas = 0;
+    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+      delay(400);
+      tentativas++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      tlsClient.setInsecure();
+      tlsClient.setTimeout(7);
+      httpClient.setReuse(true);
+      httpClient.setTimeout(7000);
+      httpPronto = true;
+      Serial.print("WIFI_OK: ");
+      Serial.println(WIFI_LIST[i].ssid);
+      return true;
+    }
   }
+
+  Serial.println("WIFI_FAIL");
   return false;
 }
 
-bool enviarBlocoFirebase(WiFiClientSecure& client, int chunkIdx, int rowStart, int rowCount, int w, const uint8_t* buf) {
-  size_t rowBytes = (size_t)w * 2;
-  size_t chunkBytes = (size_t)rowCount * rowBytes;
-  const uint8_t* ptr = buf + ((size_t)rowStart * rowBytes);
+static bool putJsonReutilizado(const String& url, const String& body) {
+  if (!httpPronto) return false;
+  if (!httpClient.begin(tlsClient, url)) {
+    httpClient.end();
+    return false;
+  }
+  httpClient.addHeader("Content-Type", "application/json");
+  int code = httpClient.PUT(body);
+  return (code > 0 && code < 300);
+}
+
+static bool enviarBloco(int idx, int r0, int rc, const uint8_t* buf) {
+  size_t rowBytes = (size_t)FRAME_W * 2;
+  size_t chunkBytes = (size_t)rc * rowBytes;
+  const uint8_t* ptr = buf + ((size_t)r0 * rowBytes);
 
   String b64 = base64::encode(ptr, chunkBytes);
   String json;
   json.reserve(b64.length() + 96);
   json += "{\"c\":";
-  json += String(chunkIdx);
+  json += String(idx);
   json += ",\"r0\":";
-  json += String(rowStart);
+  json += String(r0);
   json += ",\"rc\":";
-  json += String(rowCount);
+  json += String(rc);
   json += ",\"d\":\"";
   json += b64;
   json += "\"}";
   b64 = "";
 
-  String url = String(FIREBASE_BASE_URL) + "/blocos/" + String(chunkIdx) + ".json";
-  HTTPClient http;
-  http.setTimeout(7000);
-  if (!http.begin(client, url)) {
-    return false;
-  }
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PUT(json);
+  String url = String(FIREBASE_STREAM_URL) + "/blocos/" + String(idx) + ".json";
+  bool ok = putJsonReutilizado(url, json);
   json = "";
-  http.end();
-
-  return (code > 0 && code < 300);
+  return ok;
 }
 
-bool enviarFrameEmBlocosFirebase(unsigned long* elapsedMsOut) {
-  if (!camOk || WiFi.status() != WL_CONNECTED) {
-    lastStatusMsg = "Sem camera ou sem Wi-Fi.";
-    return false;
-  }
+static void enviarFrameLimpo() {
+  if (!camOk || WiFi.status() != WL_CONNECTED) return;
 
-  unsigned long t0 = millis();
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
-    lastStatusMsg = "Falha ao capturar frame (sem heap livre).";
-    return false;
+    Serial.println("FB_FAIL");
+    return;
   }
 
-  int w = getFrameWidth(currentFrameSize);
-  int h = getFrameHeight(currentFrameSize);
-  size_t expectedBytes = (size_t)w * (size_t)h * 2;
-
-  if (fb->len < expectedBytes) {
+  size_t expected = (size_t)FRAME_W * (size_t)FRAME_H * 2;
+  if (fb->len < expected) {
     esp_camera_fb_return(fb);
-    lastStatusMsg = "Frame incompleto: " + String(fb->len) + "/" + String(expectedBytes) + " B";
-    return false;
+    Serial.println("FB_SHORT");
+    return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  int totalChunks = (h + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
+  int totalBlocos = (FRAME_H + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
   bool ok = true;
 
-  for (int c = 0; c < totalChunks; c++) {
+  for (int c = 0; c < totalBlocos; c++) {
     int r0 = c * ROWS_PER_CHUNK;
-    int rc = min(ROWS_PER_CHUNK, h - r0);
-    if (!enviarBlocoFirebase(client, c, r0, rc, w, fb->buf)) {
+    int rc = min(ROWS_PER_CHUNK, FRAME_H - r0);
+    if (!enviarBloco(c, r0, rc, fb->buf)) {
       ok = false;
-      lastStatusMsg = "Falha no bloco " + String(c + 1) + "/" + String(totalChunks);
+      Serial.print("BLOCO_FAIL ");
+      Serial.println(c);
       break;
     }
-    delay(2);
+    yield();
   }
 
   esp_camera_fb_return(fb);
 
   if (ok) {
     frameSeq++;
-    String metaUrl = String(FIREBASE_BASE_URL) + "/meta.json";
-    String metaJson = "{\"formato\":\"rgb565\",\"w\":" + String(w) +
-                      ",\"h\":" + String(h) +
-                      ",\"blocos\":" + String(totalChunks) +
+    String metaUrl = String(FIREBASE_STREAM_URL) + "/meta.json";
+    String metaJson = "{\"formato\":\"rgb565\",\"w\":" + String(FRAME_W) +
+                      ",\"h\":" + String(FRAME_H) +
+                      ",\"blocos\":" + String(totalBlocos) +
                       ",\"frame\":" + String(frameSeq) +
                       ",\"ts\":" + String(millis()) + "}";
-
-    HTTPClient http;
-    http.setTimeout(6000);
-    if (http.begin(client, metaUrl)) {
-      http.addHeader("Content-Type", "application/json");
-      int code = http.PUT(metaJson);
-      http.end();
-      ok = (code > 0 && code < 300);
+    if (!putJsonReutilizado(metaUrl, metaJson)) {
+      Serial.println("META_FAIL");
     } else {
-      ok = false;
+      Serial.print("FRAME_OK #");
+      Serial.println(frameSeq);
     }
   }
-
-  unsigned long dt = millis() - t0;
-  if (elapsedMsOut) *elapsedMsOut = dt;
-
-  if (ok) {
-    lastStatusMsg = "Frame #" + String(frameSeq) + " (" + String(w) + "x" + String(h) + ") em " + String(dt) + " ms";
-  } else if (!lastStatusMsg.startsWith("Falha no bloco")) {
-    lastStatusMsg = "Falha ao atualizar meta em " + String(dt) + " ms";
-  }
-  return ok;
-}
-
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>ESP32-S3 -> Firebase</title></head>";
-  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
-  html += "<h2>ESP32-S3 -> Firebase</h2>";
-  html += "<p style='color:#9e9e9e;'>Wi-Fi: " + activeSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
-
-  if (!camOk) {
-    html += "<p style='color:#f66;'>Camera nao iniciou em 320x240 sem PSRAM. Veja o monitor serial.</p>";
-  } else {
-    html += "<p><label for='resSelect'>Resolucao:</label> ";
-    html += "<select id='resSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
-    html += String("<option value='QVGA'") + (currentFrameSize == FRAMESIZE_QVGA ? " selected" : "") + ">320x240 QVGA (Padrao)</option>";
-    html += String("<option value='QQVGA'") + (currentFrameSize == FRAMESIZE_QQVGA ? " selected" : "") + ">160x120 QQVGA</option>";
-    html += String("<option value='96X96'") + (currentFrameSize == FRAMESIZE_96X96 ? " selected" : "") + ">96x96</option>";
-    html += "</select></p>";
-
-    html += "<p><label for='fpsSelect'>Frequencia:</label> ";
-    html += "<select id='fpsSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
-    html += String("<option value='0'") + (targetFps == 0 ? " selected" : "") + ">Manual (1 clique)</option>";
-    html += String("<option value='1'") + (targetFps == 1 ? " selected" : "") + ">1 FPS</option>";
-    html += String("<option value='2'") + (targetFps == 2 ? " selected" : "") + ">2 FPS</option>";
-    html += String("<option value='3'") + (targetFps == 3 ? " selected" : "") + ">3 FPS</option>";
-    html += String("<option value='4'") + (targetFps == 4 ? " selected" : "") + ">4 FPS</option>";
-    html += "</select></p>";
-
-    html += "<p><button onclick='enviarAgora()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>ENVIAR AGORA</button> ";
-    html += "<button onclick='pararEnvio()' style='padding:12px 16px;font-size:16px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;margin:4px;'>PARAR</button></p>";
-
-    html += "<p id='status' style='color:#ccc;margin-top:12px;'>" + lastStatusMsg + "</p>";
-
-    html += "<script>";
-    html += "let pollTimer=null;";
-    html += "async function aplicarParametros(){";
-    html += "  const tam=document.getElementById('resSelect').value;";
-    html += "  const fps=document.getElementById('fpsSelect').value;";
-    html += "  const s=document.getElementById('status');";
-    html += "  s.textContent='Aplicando...';";
-    html += "  try{";
-    html += "    const r=await fetch('/parametros?tam='+encodeURIComponent(tam)+'&fps='+encodeURIComponent(fps),{cache:'no-store'});";
-    html += "    const d=await r.json();";
-    html += "    s.textContent=d.msg||'OK';";
-    html += "    gerenciarPoll(parseInt(fps,10));";
-    html += "  }catch(e){s.textContent='Erro ao aplicar';}";
-    html += "}";
-    html += "async function enviarAgora(){";
-    html += "  const s=document.getElementById('status');";
-    html += "  s.textContent='Enviando em blocos...';";
-    html += "  try{";
-    html += "    const r=await fetch('/enviar?t='+Date.now(),{cache:'no-store'});";
-    html += "    const d=await r.json();";
-    html += "    s.textContent=d.msg||'Concluido';";
-    html += "  }catch(e){s.textContent='Erro ao enviar';}";
-    html += "}";
-    html += "async function pararEnvio(){";
-    html += "  document.getElementById('fpsSelect').value='0';";
-    html += "  await aplicarParametros();";
-    html += "}";
-    html += "function gerenciarPoll(fps){";
-    html += "  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}";
-    html += "  if(fps>0){";
-    html += "    const ms=Math.max(250, Math.round(1000/fps));";
-    html += "    pollTimer=setInterval(async()=>{";
-    html += "      try{const r=await fetch('/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();if(d.msg)document.getElementById('status').textContent=d.msg;}catch(e){}";
-    html += "    }, ms);";
-    html += "  }";
-    html += "}";
-    html += "gerenciarPoll(" + String(targetFps) + ");";
-    html += "</script>";
-  }
-
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
-
-void handleParametros() {
-  framesize_t fs = parseFrameSize(server.arg("tam"));
-  int fps = server.arg("fps").toInt();
-  if (fps < 0) fps = 0;
-  if (fps > 4) fps = 4;
-
-  bool camReady = true;
-  if (fs != currentFrameSize) {
-    camReady = initCameraWithSize(fs);
-    camOk = camReady;
-  }
-
-  targetFps = fps;
-  lastAutoSendMs = 0;
-
-  lastStatusMsg = camReady
-    ? (String(getFrameWidth(currentFrameSize)) + "x" + String(getFrameHeight(currentFrameSize)) + " | " + (targetFps == 0 ? String("Manual") : (String(targetFps) + " FPS")))
-    : "Falha ao alocar resolucao na camera sem PSRAM.";
-
-  server.send(200, "application/json", "{\"ok\":" + String(camReady ? "true" : "false") + ",\"msg\":\"" + lastStatusMsg + "\"}");
-}
-
-void handleEnviar() {
-  unsigned long dt = 0;
-  bool ok = enviarFrameEmBlocosFirebase(&dt);
-  server.send(ok ? 200 : 500, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + lastStatusMsg + "\"}");
-}
-
-void handleStatus() {
-  server.send(200, "application/json", "{\"msg\":\"" + lastStatusMsg + "\"}");
-}
-
-bool conectarWifiLista() {
-  WiFi.mode(WIFI_STA);
-  for (size_t i = 0; i < WIFI_COUNT; i++) {
-    if (WIFI_LIST[i].ssid == nullptr || strlen(WIFI_LIST[i].ssid) == 0) continue;
-    WiFi.disconnect(true);
-    delay(150);
-    WiFi.begin(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
-    int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
-      delay(400);
-      tentativas++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      activeSsid = String(WIFI_LIST[i].ssid);
-      return true;
-    }
-  }
-  return false;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(400);
 
-  camOk = initCameraWithSize(currentFrameSize);
-  bool wifiOk = conectarWifiLista();
+  camOk = initCamera();
+  Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
 
-  if (wifiOk) {
-    Serial.print("WIFI_OK (");
-    Serial.print(activeSsid);
-    Serial.print(") IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WIFI_FAIL em todas as redes da lista");
-  }
-
-  server.on("/", handleRoot);
-  server.on("/parametros", handleParametros);
-  server.on("/enviar", handleEnviar);
-  server.on("/status", handleStatus);
-  server.begin();
+  conectarWifi();
 }
 
 void loop() {
-  server.handleClient();
-
-  if (camOk && targetFps > 0 && WiFi.status() == WL_CONNECTED) {
-    unsigned long intervaloMs = 1000UL / (unsigned long)targetFps;
-    unsigned long agora = millis();
-    if (lastAutoSendMs == 0 || (agora - lastAutoSendMs) >= intervaloMs) {
-      lastAutoSendMs = agora;
-      enviarFrameEmBlocosFirebase(nullptr);
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    conectarWifi();
+    delay(500);
+    return;
   }
+
+  unsigned long intervalo = (TARGET_FPS > 0) ? (1000UL / (unsigned long)TARGET_FPS) : 1000UL;
+  unsigned long agora = millis();
+  if (camOk && (lastSendMs == 0 || (agora - lastSendMs) >= intervalo)) {
+    lastSendMs = agora;
+    enviarFrameLimpo();
+  }
+
+  delay(5);
 }
