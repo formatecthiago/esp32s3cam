@@ -1,11 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <base64.h>
 #include "esp_camera.h"
 
-// Pinos da camera na Freenove ESP32-S3 WROOM
+// Pinos da camera na Freenove ESP32-S3
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     15
@@ -29,7 +30,6 @@ struct WifiCred {
   const char* pass;
 };
 
-// Redes Wi-Fi pre-definidas (tenta em sequencia)
 static const WifiCred WIFI_LIST[] = {
   {"FORMATEC 2G", "1234cinco@#"},
   {"NewHome",     "1234cinco@#"},
@@ -39,18 +39,54 @@ static const size_t WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
 
 static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
 
-// 320x240 RGB565 em blocos menores de 8 linhas para aliviar o pico de RAM
-static const framesize_t FRAME_SIZE = FRAMESIZE_QVGA;
-static const int FRAME_W = 320;
-static const int FRAME_H = 240;
-static const int ROWS_PER_CHUNK = 8;
-static const int TARGET_FPS = 1;
-
+WebServer server(80);
 static bool camOk = false;
+static bool temPsram = false;
+static size_t psramTotalBytes = 0;
+static framesize_t currentFrameSize = FRAMESIZE_QVGA;
+static int currentW = 320;
+static int currentH = 240;
 static unsigned long frameSeq = 0;
-static unsigned long lastSendMs = 0;
+static unsigned long lastFirebaseMs = 0;
+static const unsigned long FIREBASE_INTERVAL_MS = 1200;
+
+static void dimsForSize(framesize_t fs, int& w, int& h) {
+  if (fs == FRAMESIZE_QQVGA) {
+    w = 160;
+    h = 120;
+  } else if (fs == FRAMESIZE_VGA) {
+    w = 640;
+    h = 480;
+  } else {
+    w = 320;
+    h = 240;
+  }
+}
+
+static bool applyCameraSize(framesize_t fs) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+  if (s->set_framesize(s, fs) != 0) return false;
+  currentFrameSize = fs;
+  dimsForSize(fs, currentW, currentH);
+  return true;
+}
 
 static bool initCamera() {
+  temPsram = psramFound();
+  psramTotalBytes = ESP.getPsramSize();
+
+  Serial.print("PSRAM_FOUND: ");
+  Serial.println(temPsram ? "SIM" : "NAO");
+  Serial.print("PSRAM_TOTAL_BYTES: ");
+  Serial.println(psramTotalBytes);
+  Serial.print("PSRAM_FREE_BYTES: ");
+  Serial.println(ESP.getFreePsram());
+  Serial.print("HEAP_FREE_BYTES: ");
+  Serial.println(ESP.getFreeHeap());
+
+  dimsForSize(currentFrameSize, currentW, currentH);
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -71,11 +107,11 @@ static bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;
-  config.frame_size   = FRAME_SIZE;
+  config.frame_size   = currentFrameSize;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_DRAM;
-  config.fb_count     = 1;
+  config.fb_location  = temPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_count     = temPsram ? 2 : 1;
 
   return (esp_camera_init(&config) == ESP_OK);
 }
@@ -97,7 +133,9 @@ static bool conectarWifi() {
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("WIFI_OK: ");
-      Serial.println(WIFI_LIST[i].ssid);
+      Serial.print(WIFI_LIST[i].ssid);
+      Serial.print(" IP: ");
+      Serial.println(WiFi.localIP());
       return true;
     }
   }
@@ -106,7 +144,7 @@ static bool conectarWifi() {
   return false;
 }
 
-static bool putJsonLimpo(const String& url, const String& body) {
+static bool putFirebase(const String& url, const String& body) {
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(8);
@@ -117,93 +155,137 @@ static bool putJsonLimpo(const String& url, const String& body) {
     http.end();
     return false;
   }
-
   http.addHeader("Content-Type", "application/json");
   int code = http.PUT(body);
   http.end();
-
   return (code > 0 && code < 300);
 }
 
-static bool enviarBloco(int idx, int r0, int rc, const uint8_t* buf) {
-  size_t rowBytes = (size_t)FRAME_W * 2;
-  size_t chunkBytes = (size_t)rc * rowBytes;
-  const uint8_t* ptr = buf + ((size_t)r0 * rowBytes);
+static void enviarFrameFirebase(camera_fb_t* fb) {
+  if (!fb || WiFi.status() != WL_CONNECTED) return;
 
-  String b64 = base64::encode(ptr, chunkBytes);
-  String json;
-  json.reserve(b64.length() + 96);
-  json += "{\"c\":";
-  json += String(idx);
-  json += ",\"r0\":";
-  json += String(r0);
-  json += ",\"rc\":";
-  json += String(rc);
-  json += ",\"d\":\"";
-  json += b64;
-  json += "\"}";
+  String b64 = base64::encode(fb->buf, fb->len);
+  String payload;
+  payload.reserve(b64.length() + 140);
+  payload += "{\"w\":";
+  payload += String(currentW);
+  payload += ",\"h\":";
+  payload += String(currentH);
+  payload += ",\"frame\":";
+  payload += String(frameSeq);
+  payload += ",\"ts\":";
+  payload += String(millis());
+  payload += ",\"d\":\"";
+  payload += b64;
+  payload += "\"}";
   b64 = "";
 
-  String url = String(FIREBASE_STREAM_URL) + "/blocos/" + String(idx) + ".json";
-  bool ok = putJsonLimpo(url, json);
-  json = "";
-  return ok;
-}
-
-static void enviarFrameLimpo() {
-  if (!camOk || WiFi.status() != WL_CONNECTED) return;
-
-  Serial.print("HEAP_ANTES: ");
-  Serial.print(ESP.getFreeHeap());
-  Serial.print(" MAX_BLK: ");
-  Serial.println(ESP.getMaxAllocHeap());
-
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("FB_FAIL");
-    return;
-  }
-
-  size_t expected = (size_t)FRAME_W * (size_t)FRAME_H * 2;
-  if (fb->len < expected) {
-    esp_camera_fb_return(fb);
-    Serial.println("FB_SHORT");
-    return;
-  }
-
-  int totalBlocos = (FRAME_H + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
-  bool ok = true;
-
-  for (int c = 0; c < totalBlocos; c++) {
-    int r0 = c * ROWS_PER_CHUNK;
-    int rc = min(ROWS_PER_CHUNK, FRAME_H - r0);
-    if (!enviarBloco(c, r0, rc, fb->buf)) {
-      ok = false;
-      Serial.print("BLOCO_FAIL ");
-      Serial.println(c);
-      break;
-    }
-    delay(30);
-    yield();
-  }
-
-  esp_camera_fb_return(fb);
+  String latestUrl = String(FIREBASE_STREAM_URL) + "/latest.json";
+  bool ok = putFirebase(latestUrl, payload);
+  payload = "";
 
   if (ok) {
     frameSeq++;
     String metaUrl = String(FIREBASE_STREAM_URL) + "/meta.json";
-    String metaJson = "{\"formato\":\"rgb565\",\"w\":" + String(FRAME_W) +
-                      ",\"h\":" + String(FRAME_H) +
-                      ",\"blocos\":" + String(totalBlocos) +
+    String metaJson = "{\"w\":" + String(currentW) +
+                      ",\"h\":" + String(currentH) +
                       ",\"frame\":" + String(frameSeq) +
+                      ",\"psram\":" + String(temPsram ? 1 : 0) +
                       ",\"ts\":" + String(millis()) + "}";
-    if (!putJsonLimpo(metaUrl, metaJson)) {
-      Serial.println("META_FAIL");
-    } else {
-      Serial.print("FRAME_OK #");
-      Serial.println(frameSeq);
-    }
+    putFirebase(metaUrl, metaJson);
+    Serial.print("FB_OK #");
+    Serial.println(frameSeq);
+  } else {
+    Serial.println("FB_FAIL");
   }
+}
+
+static void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Monitor Resolucao + PSRAM</title></head><body style='background:#111;color:#eee;font-family:sans-serif;padding:14px;text-align:center;'>";
+  html += "<h3>Monitoramento & Resolucao</h3>";
+  html += "<div style='margin-bottom:10px;'>";
+  html += "<button onclick=\"setRes('qqvga')\" style='padding:8px 12px;margin:2px;'>160x120</button>";
+  html += "<button onclick=\"setRes('qvga')\" style='padding:8px 12px;margin:2px;'>320x240</button>";
+  html += "<button onclick=\"setRes('vga')\" style='padding:8px 12px;margin:2px;'>640x480</button>";
+  html += "</div>";
+  html += "<div id='log' style='background:#1d1d1d;padding:10px;border-radius:6px;font-size:13px;text-align:left;margin:0 auto 12px;max-width:480px;'>Carregando log...</div>";
+  html += "<canvas id='c' width='320' height='240' style='border:1px solid #555;max-width:100%;height:auto;'></canvas>";
+  html += "<script>";
+  html += "const c=document.getElementById('c'),ctx=c.getContext('2d'),logEl=document.getElementById('log');";
+  html += "let w=320,h=240,busy=false;";
+  html += "async function setRes(r){ await fetch('/res?size='+r); }";
+  html += "async function refreshInfo(){";
+  html += "  try{";
+  html += "    const r=await fetch('/info',{cache:'no-store'});";
+  html += "    const j=await r.json();";
+  html += "    w=j.w; h=j.h; c.width=w; c.height=h;";
+  html += "    logEl.innerHTML='PSRAM: <b>'+(j.psram?'SIM':'NAO')+'</b> ('+j.psramTotal+' B) | Livre: '+j.psramFree+' B<br>Heap Livre: '+j.heapFree+' B | Res: '+w+'x'+h+' | FB #'+j.fbFrame;";
+  html += "  }catch(e){}";
+  html += "}";
+  html += "async function tick(){";
+  html += "  if(!busy){ busy=true;";
+  html += "    try{";
+  html += "      const r=await fetch('/frame?t='+Date.now(),{cache:'no-store'});";
+  html += "      if(r.ok){";
+  html += "        const buf=new Uint8Array(await r.arrayBuffer());";
+  html += "        const img=ctx.createImageData(w,h),d=img.data;";
+  html += "        const n=Math.min(w*h,Math.floor(buf.length/2));";
+  html += "        for(let i=0;i<n;i++){";
+  html += "          const p=(buf[i*2]<<8)|buf[i*2+1];";
+  html += "          d[i*4]=((p>>11)&31)*255/31;";
+  html += "          d[i*4+1]=((p>>5)&63)*255/63;";
+  html += "          d[i*4+2]=(p&31)*255/31;";
+  html += "          d[i*4+3]=255;";
+  html += "        }";
+  html += "        ctx.putImageData(img,0,0);";
+  html += "      }";
+  html += "    }catch(e){}";
+  html += "    busy=false;";
+  html += "  }";
+  html += "  setTimeout(tick,250);";
+  html += "}";
+  html += "refreshInfo(); setInterval(refreshInfo,1500); tick();";
+  html += "</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+static void handleRes() {
+  String sz = server.arg("size");
+  framesize_t target = FRAMESIZE_QVGA;
+  if (sz == "qqvga") target = FRAMESIZE_QQVGA;
+  else if (sz == "vga") target = FRAMESIZE_VGA;
+
+  bool ok = applyCameraSize(target);
+  server.send(ok ? 200 : 500, "text/plain", ok ? "RES_OK" : "RES_FAIL");
+}
+
+static void handleInfo() {
+  String json = "{";
+  json += "\"psram\":" + String(temPsram ? "true" : "false") + ",";
+  json += "\"psramTotal\":" + String(psramTotalBytes) + ",";
+  json += "\"psramFree\":" + String(ESP.getFreePsram()) + ",";
+  json += "\"heapFree\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"w\":" + String(currentW) + ",";
+  json += "\"h\":" + String(currentH) + ",";
+  json += "\"fbFrame\":" + String(frameSeq);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleFrame() {
+  if (!camOk) {
+    server.send(500, "text/plain", "CAM_FAIL");
+    return;
+  }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "FB_FAIL");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "application/octet-stream", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
 }
 
 void setup() {
@@ -214,21 +296,28 @@ void setup() {
   Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
 
   conectarWifi();
+
+  server.on("/", handleRoot);
+  server.on("/res", handleRes);
+  server.on("/info", handleInfo);
+  server.on("/frame", handleFrame);
+  server.begin();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    conectarWifi();
-    delay(500);
-    return;
+  server.handleClient();
+
+  if (camOk && WiFi.status() == WL_CONNECTED) {
+    unsigned long agora = millis();
+    if (lastFirebaseMs == 0 || (agora - lastFirebaseMs) >= FIREBASE_INTERVAL_MS) {
+      lastFirebaseMs = agora;
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) {
+        enviarFrameFirebase(fb);
+        esp_camera_fb_return(fb);
+      }
+    }
   }
 
-  unsigned long intervalo = (TARGET_FPS > 0) ? (1000UL / (unsigned long)TARGET_FPS) : 1000UL;
-  unsigned long agora = millis();
-  if (camOk && (lastSendMs == 0 || (agora - lastSendMs) >= intervalo)) {
-    lastSendMs = agora;
-    enviarFrameLimpo();
-  }
-
-  delay(5);
+  delay(2);
 }
