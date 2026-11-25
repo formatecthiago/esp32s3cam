@@ -23,6 +23,9 @@
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
+static const int IMG_W = 96;
+static const int IMG_H = 96;
+
 WebServer server(80);
 Preferences prefs;
 
@@ -57,7 +60,7 @@ void handleRoot() {
 
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>Teste ESP32-S3 CAM</title></head>";
-  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;'>";
+  html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
   html += "<h2>Teste ESP32-S3 CAM</h2>";
   html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
   if (!camOk) {
@@ -65,8 +68,45 @@ void handleRoot() {
   } else {
     html += "<p><button onclick='dispararCaptura()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>START</button> ";
     html += "<a href='/config' style='display:inline-block;padding:12px 18px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;'>Trocar Wi-Fi</a></p>";
-    html += "<p id='status' style='color:#ccc;'>Pronto. Clique em START para capturar 1 quadro bruto.</p>";
-    html += "<script>function dispararCaptura(){const s=document.getElementById('status');s.textContent='Capturando...';fetch('/foto?t='+Date.now()).then(r=>r.blob()).then(b=>{s.textContent='Capturado: '+b.size+' bytes (RGB565 bruto)';}).catch(()=>{s.textContent='Falha ao capturar';});}</script>";
+    html += "<p id='status' style='color:#ccc;'>Pronto. Clique em START para ver a imagem.</p>";
+    html += "<canvas id='tela' width='" + String(IMG_W) + "' height='" + String(IMG_H) + "' style='display:none;width:288px;height:288px;image-rendering:pixelated;border:2px solid #444;border-radius:8px;margin:10px auto;'></canvas>";
+    html += "<script>";
+    html += "const W=" + String(IMG_W) + ", H=" + String(IMG_H) + ";";
+    html += "function desenharRGB565(buf){";
+    html += "  const cv=document.getElementById('tela');";
+    html += "  const ctx=cv.getContext('2d');";
+    html += "  const img=ctx.createImageData(W,H);";
+    html += "  const u16=new Uint16Array(buf);";
+    html += "  const out=img.data;";
+    html += "  const n=Math.min(W*H, u16.length);";
+    html += "  for(let i=0;i<n;i++){";
+    html += "    let p=u16[i];";
+    html += "    p=((p&0xff)<<8)|((p>>8)&0xff);";
+    html += "    const r=((p>>11)&0x1f)*255/31;";
+    html += "    const g=((p>>5)&0x3f)*255/63;";
+    html += "    const b=(p&0x1f)*255/31;";
+    html += "    const o=i*4;";
+    html += "    out[o]=r; out[o+1]=g; out[o+2]=b; out[o+3]=255;";
+    html += "  }";
+    html += "  ctx.putImageData(img,0,0);";
+    html += "  cv.style.display='block';";
+    html += "}";
+    html += "async function dispararCaptura(){";
+    html += "  const s=document.getElementById('status');";
+    html += "  const t0=performance.now();";
+    html += "  s.textContent='Capturando...';";
+    html += "  try{";
+    html += "    const r=await fetch('/foto?t='+Date.now(),{cache:'no-store'});";
+    html += "    if(!r.ok){s.textContent='Erro HTTP '+r.status;return;}";
+    html += "    const buf=await r.arrayBuffer();";
+    html += "    desenharRGB565(buf);";
+    html += "    const dt=Math.round(performance.now()-t0);";
+    html += "    s.textContent='Imagem: '+buf.byteLength+' bytes | Tempo: '+dt+' ms';";
+    html += "  }catch(e){";
+    html += "    s.textContent='Falha ao carregar imagem';";
+    html += "  }";
+    html += "}";
+    html += "</script>";
   }
   html += "</body></html>";
   server.send(200, "text/html", html);
@@ -127,7 +167,7 @@ bool initCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_QVGA;
+  config.frame_size   = FRAMESIZE_96X96;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_DRAM;
