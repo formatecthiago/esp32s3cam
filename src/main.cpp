@@ -3,7 +3,6 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <Preferences.h>
 #include <base64.h>
 #include "esp_camera.h"
 
@@ -26,44 +25,56 @@
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
-static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream.json";
+struct WifiCred {
+  const char* ssid;
+  const char* pass;
+};
+
+// Redes Wi-Fi pre-definidas (tenta da primeira para a ultima)
+static const WifiCred WIFI_LIST[] = {
+  {"FORMATEC 2G", "1234cinco@#"},
+  {"NewHome",     "1234cinco@#"},
+  {"REALMESPEED", "123quatro@#"}
+};
+static const size_t WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
+
+static const char* FIREBASE_BASE_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
+
+// 24 linhas por bloco em 320x240 RGB565: 24 * 320 * 2 = 15360 bytes crus (~20480 chars Base64)
+static const int ROWS_PER_CHUNK = 24;
 
 WebServer server(80);
-Preferences prefs;
 
 bool camOk = false;
-bool apMode = false;
-String savedSsid = "";
-String savedPass = "";
-framesize_t currentFrameSize = FRAMESIZE_96X96;
-
-// 0 = Manual (1 disparo), 1..4 = FPS alvo
-int targetFps = 0;
+framesize_t currentFrameSize = FRAMESIZE_QVGA; // Padrao 320x240
+int targetFps = 0; // 0 = Manual, 1..4 = FPS
 unsigned long lastAutoSendMs = 0;
-String lastStatusMsg = "Pronto.";
+unsigned long frameSeq = 0;
+String activeSsid = "";
+String lastStatusMsg = "Pronto em 320x240.";
 
 int getFrameWidth(framesize_t fs) {
   switch (fs) {
+    case FRAMESIZE_96X96: return 96;
     case FRAMESIZE_QQVGA: return 160;
-    case FRAMESIZE_QVGA:  return 320;
-    case FRAMESIZE_96X96:
-    default:              return 96;
+    case FRAMESIZE_QVGA:
+    default:              return 320;
   }
 }
 
 int getFrameHeight(framesize_t fs) {
   switch (fs) {
+    case FRAMESIZE_96X96: return 96;
     case FRAMESIZE_QQVGA: return 120;
-    case FRAMESIZE_QVGA:  return 240;
-    case FRAMESIZE_96X96:
-    default:              return 96;
+    case FRAMESIZE_QVGA:
+    default:              return 240;
   }
 }
 
 framesize_t parseFrameSize(const String& val) {
+  if (val == "96X96") return FRAMESIZE_96X96;
   if (val == "QQVGA") return FRAMESIZE_QQVGA;
-  if (val == "QVGA")  return FRAMESIZE_QVGA;
-  return FRAMESIZE_96X96;
+  return FRAMESIZE_QVGA;
 }
 
 bool initCameraWithSize(framesize_t fs) {
@@ -93,7 +104,6 @@ bool initCameraWithSize(framesize_t fs) {
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_DRAM;
-  config.jpeg_quality = 12;
   config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
@@ -104,7 +114,40 @@ bool initCameraWithSize(framesize_t fs) {
   return false;
 }
 
-bool enviarFrameBrutoFirebase(unsigned long* elapsedMsOut, size_t* rawLenOut) {
+bool enviarBlocoFirebase(WiFiClientSecure& client, int chunkIdx, int rowStart, int rowCount, int w, const uint8_t* buf) {
+  size_t rowBytes = (size_t)w * 2;
+  size_t chunkBytes = (size_t)rowCount * rowBytes;
+  const uint8_t* ptr = buf + ((size_t)rowStart * rowBytes);
+
+  String b64 = base64::encode(ptr, chunkBytes);
+  String json;
+  json.reserve(b64.length() + 96);
+  json += "{\"c\":";
+  json += String(chunkIdx);
+  json += ",\"r0\":";
+  json += String(rowStart);
+  json += ",\"rc\":";
+  json += String(rowCount);
+  json += ",\"d\":\"";
+  json += b64;
+  json += "\"}";
+  b64 = "";
+
+  String url = String(FIREBASE_BASE_URL) + "/blocos/" + String(chunkIdx) + ".json";
+  HTTPClient http;
+  http.setTimeout(7000);
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(json);
+  json = "";
+  http.end();
+
+  return (code > 0 && code < 300);
+}
+
+bool enviarFrameEmBlocosFirebase(unsigned long* elapsedMsOut) {
   if (!camOk || WiFi.status() != WL_CONNECTED) {
     lastStatusMsg = "Sem camera ou sem Wi-Fi.";
     return false;
@@ -113,110 +156,99 @@ bool enviarFrameBrutoFirebase(unsigned long* elapsedMsOut, size_t* rawLenOut) {
   unsigned long t0 = millis();
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
-    lastStatusMsg = "Falha ao capturar frame da camera.";
+    lastStatusMsg = "Falha ao capturar frame (sem heap livre).";
     return false;
   }
 
-  size_t rawLen = fb->len;
   int w = getFrameWidth(currentFrameSize);
   int h = getFrameHeight(currentFrameSize);
+  size_t expectedBytes = (size_t)w * (size_t)h * 2;
 
-  String b64 = base64::encode(fb->buf, rawLen);
-  esp_camera_fb_return(fb);
-
-  String payload;
-  payload.reserve(b64.length() + 128);
-  payload += "{\"formato\":\"rgb565\",\"w\":";
-  payload += String(w);
-  payload += ",\"h\":";
-  payload += String(h);
-  payload += ",\"timestamp\":";
-  payload += String((unsigned long)millis());
-  payload += ",\"dados\":\"";
-  payload += b64;
-  payload += "\"}";
-  b64 = "";
+  if (fb->len < expectedBytes) {
+    esp_camera_fb_return(fb);
+    lastStatusMsg = "Frame incompleto: " + String(fb->len) + "/" + String(expectedBytes) + " B";
+    return false;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();
 
-  HTTPClient http;
-  http.setTimeout(8000);
-  if (!http.begin(client, FIREBASE_STREAM_URL)) {
-    lastStatusMsg = "Falha ao iniciar conexao HTTPS com Firebase.";
-    return false;
+  int totalChunks = (h + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
+  bool ok = true;
+
+  for (int c = 0; c < totalChunks; c++) {
+    int r0 = c * ROWS_PER_CHUNK;
+    int rc = min(ROWS_PER_CHUNK, h - r0);
+    if (!enviarBlocoFirebase(client, c, r0, rc, w, fb->buf)) {
+      ok = false;
+      lastStatusMsg = "Falha no bloco " + String(c + 1) + "/" + String(totalChunks);
+      break;
+    }
+    delay(2);
   }
 
-  http.addHeader("Content-Type", "application/json");
-  int httpCode = http.PUT(payload);
-  payload = "";
-  http.end();
+  esp_camera_fb_return(fb);
+
+  if (ok) {
+    frameSeq++;
+    String metaUrl = String(FIREBASE_BASE_URL) + "/meta.json";
+    String metaJson = "{\"formato\":\"rgb565\",\"w\":" + String(w) +
+                      ",\"h\":" + String(h) +
+                      ",\"blocos\":" + String(totalChunks) +
+                      ",\"frame\":" + String(frameSeq) +
+                      ",\"ts\":" + String(millis()) + "}";
+
+    HTTPClient http;
+    http.setTimeout(6000);
+    if (http.begin(client, metaUrl)) {
+      http.addHeader("Content-Type", "application/json");
+      int code = http.PUT(metaJson);
+      http.end();
+      ok = (code > 0 && code < 300);
+    } else {
+      ok = false;
+    }
+  }
 
   unsigned long dt = millis() - t0;
   if (elapsedMsOut) *elapsedMsOut = dt;
-  if (rawLenOut) *rawLenOut = rawLen;
 
-  if (httpCode > 0 && httpCode < 300) {
-    lastStatusMsg = "Enviado " + String(rawLen) + "B (" + String(w) + "x" + String(h) + ") em " + String(dt) + " ms (HTTP " + String(httpCode) + ")";
-    return true;
-  } else {
-    lastStatusMsg = "Erro Firebase HTTP " + String(httpCode) + " em " + String(dt) + " ms";
-    return false;
+  if (ok) {
+    lastStatusMsg = "Frame #" + String(frameSeq) + " (" + String(w) + "x" + String(h) + ") em " + String(dt) + " ms";
+  } else if (!lastStatusMsg.startsWith("Falha no bloco")) {
+    lastStatusMsg = "Falha ao atualizar meta em " + String(dt) + " ms";
   }
-}
-
-String htmlConfigPage(String msg = "") {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Configurar Wi-Fi ESP32-S3</title></head>";
-  html += "<body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;max-width:420px;margin:auto;'>";
-  html += "<h2>Configurar Wi-Fi da Camera</h2>";
-  if (msg.length() > 0) {
-    html += "<p style='background:#222;padding:10px;border-left:4px solid #4caf50;'>" + msg + "</p>";
-  }
-  html += "<form action='/salvar' method='POST'>";
-  html += "<label>Nome da Rede Wi-Fi (SSID):</label><br>";
-  html += "<input name='ssid' value='" + savedSsid + "' required style='width:100%;padding:10px;margin:6px 0 14px;font-size:16px;'><br>";
-  html += "<label>Senha do Wi-Fi:</label><br>";
-  html += "<input name='pass' type='password' placeholder='Digite a senha' style='width:100%;padding:10px;margin:6px 0 18px;font-size:16px;'><br>";
-  html += "<button type='submit' style='width:100%;padding:12px;font-size:16px;background:#2e7d32;color:#fff;border:none;border-radius:6px;'>Salvar e Reiniciar</button>";
-  html += "</form></body></html>";
-  return html;
+  return ok;
 }
 
 void handleRoot() {
-  if (apMode) {
-    server.send(200, "text/html", htmlConfigPage("Conectado ao modo de configuracao. Informe o Wi-Fi abaixo."));
-    return;
-  }
-
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Controle ESP32-S3 -> Firebase</title></head>";
+  html += "<title>ESP32-S3 -> Firebase</title></head>";
   html += "<body style='font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:16px;max-width:440px;margin:auto;'>";
-  html += "<h2>ESP32-S3 -> Firebase (Bruto)</h2>";
-  html += "<p style='color:#9e9e9e;'>Rede: " + savedSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
+  html += "<h2>ESP32-S3 -> Firebase</h2>";
+  html += "<p style='color:#9e9e9e;'>Wi-Fi: " + activeSsid + " | IP: " + WiFi.localIP().toString() + "</p>";
 
   if (!camOk) {
-    html += "<p style='color:#f66;'>Camera nao iniciou. Confira o cabo flat.</p>";
+    html += "<p style='color:#f66;'>Camera nao iniciou em 320x240 sem PSRAM. Veja o monitor serial.</p>";
   } else {
     html += "<p><label for='resSelect'>Resolucao:</label> ";
     html += "<select id='resSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
-    html += String("<option value='96X96'") + (currentFrameSize == FRAMESIZE_96X96 ? " selected" : "") + ">96x96 (Leve)</option>";
-    html += String("<option value='QQVGA'") + (currentFrameSize == FRAMESIZE_QQVGA ? " selected" : "") + ">160x120 QQVGA (Medio)</option>";
-    html += String("<option value='QVGA'") + (currentFrameSize == FRAMESIZE_QVGA ? " selected" : "") + ">320x240 QVGA (Pesado)</option>";
+    html += String("<option value='QVGA'") + (currentFrameSize == FRAMESIZE_QVGA ? " selected" : "") + ">320x240 QVGA (Padrao)</option>";
+    html += String("<option value='QQVGA'") + (currentFrameSize == FRAMESIZE_QQVGA ? " selected" : "") + ">160x120 QQVGA</option>";
+    html += String("<option value='96X96'") + (currentFrameSize == FRAMESIZE_96X96 ? " selected" : "") + ">96x96</option>";
     html += "</select></p>";
 
-    html += "<p><label for='fpsSelect'>Frequencia de envio:</label> ";
+    html += "<p><label for='fpsSelect'>Frequencia:</label> ";
     html += "<select id='fpsSelect' onchange='aplicarParametros()' style='padding:8px 10px;font-size:15px;border-radius:6px;'>";
     html += String("<option value='0'") + (targetFps == 0 ? " selected" : "") + ">Manual (1 clique)</option>";
-    html += String("<option value='1'") + (targetFps == 1 ? " selected" : "") + ">1 FPS (1000 ms)</option>";
-    html += String("<option value='2'") + (targetFps == 2 ? " selected" : "") + ">2 FPS (500 ms)</option>";
-    html += String("<option value='3'") + (targetFps == 3 ? " selected" : "") + ">3 FPS (333 ms)</option>";
-    html += String("<option value='4'") + (targetFps == 4 ? " selected" : "") + ">4 FPS (250 ms)</option>";
+    html += String("<option value='1'") + (targetFps == 1 ? " selected" : "") + ">1 FPS</option>";
+    html += String("<option value='2'") + (targetFps == 2 ? " selected" : "") + ">2 FPS</option>";
+    html += String("<option value='3'") + (targetFps == 3 ? " selected" : "") + ">3 FPS</option>";
+    html += String("<option value='4'") + (targetFps == 4 ? " selected" : "") + ">4 FPS</option>";
     html += "</select></p>";
 
     html += "<p><button onclick='enviarAgora()' style='padding:12px 22px;font-size:16px;font-weight:bold;background:#2e7d32;color:#fff;border:none;border-radius:6px;margin:4px;'>ENVIAR AGORA</button> ";
-    html += "<button onclick='pararEnvio()' style='padding:12px 16px;font-size:16px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;margin:4px;'>PARAR</button> ";
-    html += "<a href='/config' style='display:inline-block;padding:12px 16px;font-size:16px;background:#333;color:#fff;text-decoration:none;border-radius:6px;margin:4px;'>Wi-Fi</a></p>";
+    html += "<button onclick='pararEnvio()' style='padding:12px 16px;font-size:16px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;margin:4px;'>PARAR</button></p>";
 
     html += "<p id='status' style='color:#ccc;margin-top:12px;'>" + lastStatusMsg + "</p>";
 
@@ -226,26 +258,22 @@ void handleRoot() {
     html += "  const tam=document.getElementById('resSelect').value;";
     html += "  const fps=document.getElementById('fpsSelect').value;";
     html += "  const s=document.getElementById('status');";
-    html += "  s.textContent='Aplicando parametros...';";
+    html += "  s.textContent='Aplicando...';";
     html += "  try{";
     html += "    const r=await fetch('/parametros?tam='+encodeURIComponent(tam)+'&fps='+encodeURIComponent(fps),{cache:'no-store'});";
     html += "    const d=await r.json();";
-    html += "    s.textContent=d.msg||'Parametros atualizados';";
+    html += "    s.textContent=d.msg||'OK';";
     html += "    gerenciarPoll(parseInt(fps,10));";
-    html += "  }catch(e){";
-    html += "    s.textContent='Falha ao atualizar parametros';";
-    html += "  }";
+    html += "  }catch(e){s.textContent='Erro ao aplicar';}";
     html += "}";
     html += "async function enviarAgora(){";
     html += "  const s=document.getElementById('status');";
-    html += "  s.textContent='Enviando frame bruto ao Firebase...';";
+    html += "  s.textContent='Enviando em blocos...';";
     html += "  try{";
     html += "    const r=await fetch('/enviar?t='+Date.now(),{cache:'no-store'});";
     html += "    const d=await r.json();";
     html += "    s.textContent=d.msg||'Concluido';";
-    html += "  }catch(e){";
-    html += "    s.textContent='Falha na requisicao de envio';";
-    html += "  }";
+    html += "  }catch(e){s.textContent='Erro ao enviar';}";
     html += "}";
     html += "async function pararEnvio(){";
     html += "  document.getElementById('fpsSelect').value='0';";
@@ -283,18 +311,16 @@ void handleParametros() {
   targetFps = fps;
   lastAutoSendMs = 0;
 
-  String msg = camReady
-    ? ("Resolucao " + String(getFrameWidth(currentFrameSize)) + "x" + String(getFrameHeight(currentFrameSize)) + " | Frequencia: " + (targetFps == 0 ? String("Manual") : (String(targetFps) + " FPS")))
+  lastStatusMsg = camReady
+    ? (String(getFrameWidth(currentFrameSize)) + "x" + String(getFrameHeight(currentFrameSize)) + " | " + (targetFps == 0 ? String("Manual") : (String(targetFps) + " FPS")))
     : "Falha ao alocar resolucao na camera sem PSRAM.";
 
-  lastStatusMsg = msg;
-  server.send(200, "application/json", "{\"ok\":" + String(camReady ? "true" : "false") + ",\"msg\":\"" + msg + "\"}");
+  server.send(200, "application/json", "{\"ok\":" + String(camReady ? "true" : "false") + ",\"msg\":\"" + lastStatusMsg + "\"}");
 }
 
 void handleEnviar() {
   unsigned long dt = 0;
-  size_t rawLen = 0;
-  bool ok = enviarFrameBrutoFirebase(&dt, &rawLen);
+  bool ok = enviarFrameEmBlocosFirebase(&dt);
   server.send(ok ? 200 : 500, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + lastStatusMsg + "\"}");
 }
 
@@ -302,88 +328,58 @@ void handleStatus() {
   server.send(200, "application/json", "{\"msg\":\"" + lastStatusMsg + "\"}");
 }
 
-void handleConfig() {
-  server.send(200, "text/html", htmlConfigPage());
-}
-
-void handleSalvar() {
-  String s = server.arg("ssid");
-  String p = server.arg("pass");
-  s.trim();
-  if (s.length() == 0) {
-    server.send(400, "text/html", htmlConfigPage("O nome da rede (SSID) nao pode ficar vazio."));
-    return;
+bool conectarWifiLista() {
+  WiFi.mode(WIFI_STA);
+  for (size_t i = 0; i < WIFI_COUNT; i++) {
+    if (WIFI_LIST[i].ssid == nullptr || strlen(WIFI_LIST[i].ssid) == 0) continue;
+    WiFi.disconnect(true);
+    delay(150);
+    WiFi.begin(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
+    int tentativas = 0;
+    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+      delay(400);
+      tentativas++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      activeSsid = String(WIFI_LIST[i].ssid);
+      return true;
+    }
   }
-  prefs.begin("wifi_cfg", false);
-  prefs.putString("ssid", s);
-  prefs.putString("pass", p);
-  prefs.end();
-
-  server.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#111;color:#fff;padding:20px;'><h3>Salvo! Reiniciando a placa para conectar em: " + s + "</h3></body></html>");
-  delay(1500);
-  ESP.restart();
-}
-
-void startAPConfig() {
-  apMode = true;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-CAM-CONFIG");
-  Serial.println("MODO_CONFIG_AP: Conecte no WiFi ESP32-CAM-CONFIG e abra http://192.168.4.1");
+  return false;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(800);
+  delay(500);
 
   camOk = initCameraWithSize(currentFrameSize);
-  Serial.println(camOk ? "CAM_OK" : "CAM_FAIL");
+  bool wifiOk = conectarWifiLista();
 
-  prefs.begin("wifi_cfg", true);
-  savedSsid = prefs.getString("ssid", "");
-  savedPass = prefs.getString("pass", "");
-  prefs.end();
-
-  if (savedSsid.length() > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-    Serial.print("Conectando em " + savedSsid);
-    int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 30) {
-      delay(500);
-      Serial.print(".");
-      tentativas++;
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("WIFI_OK IP: ");
-      Serial.println(WiFi.localIP());
-    } else {
-      Serial.println("WIFI_FAIL -> Abrindo AP de configuracao");
-      startAPConfig();
-    }
+  if (wifiOk) {
+    Serial.print("WIFI_OK (");
+    Serial.print(activeSsid);
+    Serial.print(") IP: ");
+    Serial.println(WiFi.localIP());
   } else {
-    startAPConfig();
+    Serial.println("WIFI_FAIL em todas as redes da lista");
   }
 
   server.on("/", handleRoot);
   server.on("/parametros", handleParametros);
   server.on("/enviar", handleEnviar);
   server.on("/status", handleStatus);
-  server.on("/config", handleConfig);
-  server.on("/salvar", HTTP_POST, handleSalvar);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
 
-  if (!apMode && camOk && targetFps > 0 && WiFi.status() == WL_CONNECTED) {
+  if (camOk && targetFps > 0 && WiFi.status() == WL_CONNECTED) {
     unsigned long intervaloMs = 1000UL / (unsigned long)targetFps;
     unsigned long agora = millis();
     if (lastAutoSendMs == 0 || (agora - lastAutoSendMs) >= intervaloMs) {
       lastAutoSendMs = agora;
-      enviarFrameBrutoFirebase(nullptr, nullptr);
+      enviarFrameEmBlocosFirebase(nullptr);
     }
   }
 }
