@@ -37,7 +37,7 @@ static const WifiCred WIFI_LIST[] = {
 };
 static const size_t WIFI_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
 
-static const char* FIREBASE_STREAM_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream";
+static const char* FIREBASE_LATEST_URL = "https://portaria-cam-default-rtdb.firebaseio.com/camera/stream/latest.json";
 
 WebServer server(80);
 static bool camOk = false;
@@ -49,8 +49,11 @@ static int currentH = 240;
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
 static unsigned long lastClientReqMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 1200;
+static const unsigned long FIREBASE_INTERVAL_MS = 1500;
 static const unsigned long WEB_ACTIVE_PAUSE_MS = 2500;
+
+static WiFiClientSecure fbClient;
+static bool fbClientReady = false;
 
 static void dimsForSize(framesize_t fs, int& w, int& h) {
   if (fs == FRAMESIZE_QQVGA) {
@@ -146,59 +149,58 @@ static bool conectarWifi() {
   return false;
 }
 
-static bool putFirebase(const String& url, const String& body) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(8);
-
-  HTTPClient http;
-  http.setTimeout(8000);
-  if (!http.begin(client, url)) {
-    http.end();
-    return false;
-  }
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PUT(body);
-  http.end();
-  return (code > 0 && code < 300);
-}
-
 static void enviarFrameFirebase(camera_fb_t* fb) {
   if (!fb || WiFi.status() != WL_CONNECTED) return;
 
   String b64 = base64::encode(fb->buf, fb->len);
+  unsigned long nextFrame = frameSeq + 1;
+
   String payload;
-  payload.reserve(b64.length() + 140);
-  payload += "{\"w\":";
+  payload.reserve(b64.length() + 180);
+  payload += "{\"formato\":\"rgb565\"";
+  payload += ",\"w\":";
   payload += String(currentW);
   payload += ",\"h\":";
   payload += String(currentH);
   payload += ",\"frame\":";
-  payload += String(frameSeq);
+  payload += String(nextFrame);
+  payload += ",\"psram\":";
+  payload += String(temPsram ? 1 : 0);
   payload += ",\"ts\":";
   payload += String(millis());
-  payload += ",\"d\":\"";
+  payload += ",\"dados\":\"";
   payload += b64;
   payload += "\"}";
   b64 = "";
 
-  String latestUrl = String(FIREBASE_STREAM_URL) + "/latest.json";
-  bool ok = putFirebase(latestUrl, payload);
+  if (!fbClientReady) {
+    fbClient.setInsecure();
+    fbClient.setTimeout(6);
+    fbClientReady = true;
+  }
+
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.setReuse(true);
+
+  if (!http.begin(fbClient, FIREBASE_LATEST_URL)) {
+    http.end();
+    Serial.println("FB_FAIL");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(payload);
+  http.end();
   payload = "";
 
-  if (ok) {
-    frameSeq++;
-    String metaUrl = String(FIREBASE_STREAM_URL) + "/meta.json";
-    String metaJson = "{\"w\":" + String(currentW) +
-                      ",\"h\":" + String(currentH) +
-                      ",\"frame\":" + String(frameSeq) +
-                      ",\"psram\":" + String(temPsram ? 1 : 0) +
-                      ",\"ts\":" + String(millis()) + "}";
-    putFirebase(metaUrl, metaJson);
+  if (code > 0 && code < 300) {
+    frameSeq = nextFrame;
     Serial.print("FB_OK #");
     Serial.println(frameSeq);
   } else {
-    Serial.println("FB_FAIL");
+    Serial.print("FB_FAIL ");
+    Serial.println(code);
   }
 }
 
