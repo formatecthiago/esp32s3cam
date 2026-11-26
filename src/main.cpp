@@ -1,3 +1,13 @@
+/*
+ * ============================================================================
+ * ARQUIVO: src/main.cpp
+ * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
+ * INTERVENÇÃO: Migração de RGB565 para PIXFORMAT_JPEG (PSRAM) + envio direto
+ *              em data:image/jpeg;base64 para acelerar upload no Firebase e
+ *              renderização no Portaria-cam.
+ * ============================================================================
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -49,8 +59,9 @@ static int currentH = 240;
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
 static unsigned long lastClientReqMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 1500;
+static const unsigned long FIREBASE_INTERVAL_MS = 600;
 static const unsigned long WEB_ACTIVE_PAUSE_MS = 2500;
+static const int JPEG_QUALITY_VAL = 16;
 
 static WiFiClientSecure fbClient;
 static bool fbClientReady = false;
@@ -111,10 +122,11 @@ static bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000;
+  config.xclk_freq_hz = 16000000;
   config.frame_size   = currentFrameSize;
-  config.pixel_format = PIXFORMAT_RGB565;
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.jpeg_quality = JPEG_QUALITY_VAL;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
   config.fb_location  = temPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.fb_count     = temPsram ? 2 : 1;
 
@@ -150,14 +162,14 @@ static bool conectarWifi() {
 }
 
 static void enviarFrameFirebase(camera_fb_t* fb) {
-  if (!fb || WiFi.status() != WL_CONNECTED) return;
+  if (!fb || !fb->buf || fb->len == 0 || WiFi.status() != WL_CONNECTED) return;
 
   String b64 = base64::encode(fb->buf, fb->len);
   unsigned long nextFrame = frameSeq + 1;
 
   String payload;
   payload.reserve(b64.length() + 180);
-  payload += "{\"formato\":\"rgb565\"";
+  payload += "{\"formato\":\"jpeg\"";
   payload += ",\"w\":";
   payload += String(currentW);
   payload += ",\"h\":";
@@ -168,19 +180,19 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
   payload += String(temPsram ? 1 : 0);
   payload += ",\"ts\":";
   payload += String(millis());
-  payload += ",\"dados\":\"";
+  payload += ",\"imagem\":\"data:image/jpeg;base64,";
   payload += b64;
   payload += "\"}";
   b64 = "";
 
   if (!fbClientReady) {
     fbClient.setInsecure();
-    fbClient.setTimeout(6);
+    fbClient.setTimeout(5);
     fbClientReady = true;
   }
 
   HTTPClient http;
-  http.setTimeout(6000);
+  http.setTimeout(5000);
   http.setReuse(true);
 
   if (!http.begin(fbClient, FIREBASE_LATEST_URL)) {
@@ -197,7 +209,10 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
   if (code > 0 && code < 300) {
     frameSeq = nextFrame;
     Serial.print("FB_OK #");
-    Serial.println(frameSeq);
+    Serial.print(frameSeq);
+    Serial.print(" (");
+    Serial.print(fb->len);
+    Serial.println(" B)");
   } else {
     Serial.print("FB_FAIL ");
     Serial.println(code);
@@ -207,24 +222,24 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
 static void handleRoot() {
   lastClientReqMs = millis();
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Monitor Resolucao + PSRAM</title></head><body style='background:#111;color:#eee;font-family:sans-serif;padding:14px;text-align:center;'>";
-  html += "<h3>Monitoramento & Resolucao</h3>";
+  html += "<title>Monitor JPEG + PSRAM</title></head><body style='background:#111;color:#eee;font-family:sans-serif;padding:14px;text-align:center;'>";
+  html += "<h3>Monitoramento JPEG & PSRAM</h3>";
   html += "<div style='margin-bottom:10px;'>";
   html += "<button onclick=\"setRes('qqvga')\" style='padding:8px 12px;margin:2px;'>160x120</button>";
   html += "<button onclick=\"setRes('qvga')\" style='padding:8px 12px;margin:2px;'>320x240</button>";
   html += "<button onclick=\"setRes('vga')\" style='padding:8px 12px;margin:2px;'>640x480</button>";
   html += "</div>";
   html += "<div id='log' style='background:#1d1d1d;padding:10px;border-radius:6px;font-size:13px;text-align:left;margin:0 auto 12px;max-width:480px;'>Carregando log...</div>";
-  html += "<canvas id='c' width='320' height='240' style='border:1px solid #555;max-width:100%;height:auto;'></canvas>";
+  html += "<img id='img' src='' style='border:1px solid #555;max-width:100%;height:auto;background:#000;' alt='Frame JPEG'>";
   html += "<script>";
-  html += "const c=document.getElementById('c'),ctx=c.getContext('2d'),logEl=document.getElementById('log');";
-  html += "let w=320,h=240,busy=false;";
+  html += "const imgEl=document.getElementById('img'),logEl=document.getElementById('log');";
+  html += "let w=320,h=240,busy=false,lastUrl='';";
   html += "async function setRes(r){ await fetch('/res?size='+r); await refreshInfo(); }";
   html += "async function refreshInfo(){";
   html += "  try{";
   html += "    const r=await fetch('/info',{cache:'no-store'});";
   html += "    const j=await r.json();";
-  html += "    if(c.width!==j.w||c.height!==j.h){ w=j.w; h=j.h; c.width=w; c.height=h; }";
+  html += "    w=j.w; h=j.h;";
   html += "    logEl.innerHTML='PSRAM: <b>'+(j.psram?'SIM':'NAO')+'</b> ('+j.psramTotal+' B) | Livre: '+j.psramFree+' B<br>Heap Livre: '+j.heapFree+' B | Res: '+w+'x'+h+' | FB #'+j.fbFrame;";
   html += "  }catch(e){}";
   html += "}";
@@ -233,23 +248,17 @@ static void handleRoot() {
   html += "    try{";
   html += "      const r=await fetch('/frame?t='+Date.now(),{cache:'no-store'});";
   html += "      if(r.ok){";
-  html += "        const buf=new Uint8Array(await r.arrayBuffer());";
-  html += "        if(buf.length===w*h*2){";
-  html += "          const img=ctx.createImageData(w,h),d=img.data;";
-  html += "          for(let i=0;i<w*h;i++){";
-  html += "            const p=(buf[i*2]<<8)|buf[i*2+1];";
-  html += "            d[i*4]=((p>>11)&31)*255/31;";
-  html += "            d[i*4+1]=((p>>5)&63)*255/63;";
-  html += "            d[i*4+2]=(p&31)*255/31;";
-  html += "            d[i*4+3]=255;";
-  html += "          }";
-  html += "          ctx.putImageData(img,0,0);";
+  html += "        const blob=await r.blob();";
+  html += "        if(blob.size>0){";
+  html += "          const novoUrl=URL.createObjectURL(blob);";
+  html += "          imgEl.onload=()=>{ if(lastUrl){ URL.revokeObjectURL(lastUrl); } lastUrl=novoUrl; };";
+  html += "          imgEl.src=novoUrl;";
   html += "        }";
   html += "      }";
   html += "    }catch(e){}";
   html += "    busy=false;";
   html += "  }";
-  html += "  setTimeout(tick,250);";
+  html += "  setTimeout(tick,160);";
   html += "}";
   html += "refreshInfo(); setInterval(refreshInfo,1500); tick();";
   html += "</script></body></html>";
@@ -293,7 +302,7 @@ static void handleFrame() {
     return;
   }
   server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "application/octet-stream", (const char*)fb->buf, fb->len);
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
   esp_camera_fb_return(fb);
 }
 
