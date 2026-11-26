@@ -48,7 +48,9 @@ static int currentW = 320;
 static int currentH = 240;
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
+static unsigned long lastClientReqMs = 0;
 static const unsigned long FIREBASE_INTERVAL_MS = 1200;
+static const unsigned long WEB_ACTIVE_PAUSE_MS = 2500;
 
 static void dimsForSize(framesize_t fs, int& w, int& h) {
   if (fs == FRAMESIZE_QQVGA) {
@@ -201,6 +203,7 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
 }
 
 static void handleRoot() {
+  lastClientReqMs = millis();
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>Monitor Resolucao + PSRAM</title></head><body style='background:#111;color:#eee;font-family:sans-serif;padding:14px;text-align:center;'>";
   html += "<h3>Monitoramento & Resolucao</h3>";
@@ -214,12 +217,12 @@ static void handleRoot() {
   html += "<script>";
   html += "const c=document.getElementById('c'),ctx=c.getContext('2d'),logEl=document.getElementById('log');";
   html += "let w=320,h=240,busy=false;";
-  html += "async function setRes(r){ await fetch('/res?size='+r); }";
+  html += "async function setRes(r){ await fetch('/res?size='+r); await refreshInfo(); }";
   html += "async function refreshInfo(){";
   html += "  try{";
   html += "    const r=await fetch('/info',{cache:'no-store'});";
   html += "    const j=await r.json();";
-  html += "    w=j.w; h=j.h; c.width=w; c.height=h;";
+  html += "    if(c.width!==j.w||c.height!==j.h){ w=j.w; h=j.h; c.width=w; c.height=h; }";
   html += "    logEl.innerHTML='PSRAM: <b>'+(j.psram?'SIM':'NAO')+'</b> ('+j.psramTotal+' B) | Livre: '+j.psramFree+' B<br>Heap Livre: '+j.heapFree+' B | Res: '+w+'x'+h+' | FB #'+j.fbFrame;";
   html += "  }catch(e){}";
   html += "}";
@@ -229,16 +232,17 @@ static void handleRoot() {
   html += "      const r=await fetch('/frame?t='+Date.now(),{cache:'no-store'});";
   html += "      if(r.ok){";
   html += "        const buf=new Uint8Array(await r.arrayBuffer());";
-  html += "        const img=ctx.createImageData(w,h),d=img.data;";
-  html += "        const n=Math.min(w*h,Math.floor(buf.length/2));";
-  html += "        for(let i=0;i<n;i++){";
-  html += "          const p=(buf[i*2]<<8)|buf[i*2+1];";
-  html += "          d[i*4]=((p>>11)&31)*255/31;";
-  html += "          d[i*4+1]=((p>>5)&63)*255/63;";
-  html += "          d[i*4+2]=(p&31)*255/31;";
-  html += "          d[i*4+3]=255;";
+  html += "        if(buf.length===w*h*2){";
+  html += "          const img=ctx.createImageData(w,h),d=img.data;";
+  html += "          for(let i=0;i<w*h;i++){";
+  html += "            const p=(buf[i*2]<<8)|buf[i*2+1];";
+  html += "            d[i*4]=((p>>11)&31)*255/31;";
+  html += "            d[i*4+1]=((p>>5)&63)*255/63;";
+  html += "            d[i*4+2]=(p&31)*255/31;";
+  html += "            d[i*4+3]=255;";
+  html += "          }";
+  html += "          ctx.putImageData(img,0,0);";
   html += "        }";
-  html += "        ctx.putImageData(img,0,0);";
   html += "      }";
   html += "    }catch(e){}";
   html += "    busy=false;";
@@ -251,6 +255,7 @@ static void handleRoot() {
 }
 
 static void handleRes() {
+  lastClientReqMs = millis();
   String sz = server.arg("size");
   framesize_t target = FRAMESIZE_QVGA;
   if (sz == "qqvga") target = FRAMESIZE_QQVGA;
@@ -261,6 +266,7 @@ static void handleRes() {
 }
 
 static void handleInfo() {
+  lastClientReqMs = millis();
   String json = "{";
   json += "\"psram\":" + String(temPsram ? "true" : "false") + ",";
   json += "\"psramTotal\":" + String(psramTotalBytes) + ",";
@@ -274,6 +280,7 @@ static void handleInfo() {
 }
 
 static void handleFrame() {
+  lastClientReqMs = millis();
   if (!camOk) {
     server.send(500, "text/plain", "CAM_FAIL");
     return;
@@ -309,7 +316,8 @@ void loop() {
 
   if (camOk && WiFi.status() == WL_CONNECTED) {
     unsigned long agora = millis();
-    if (lastFirebaseMs == 0 || (agora - lastFirebaseMs) >= FIREBASE_INTERVAL_MS) {
+    bool paginaAtiva = (lastClientReqMs > 0 && (agora - lastClientReqMs) < WEB_ACTIVE_PAUSE_MS);
+    if (!paginaAtiva && (lastFirebaseMs == 0 || (agora - lastFirebaseMs) >= FIREBASE_INTERVAL_MS)) {
       lastFirebaseMs = agora;
       camera_fb_t* fb = esp_camera_fb_get();
       if (fb) {
