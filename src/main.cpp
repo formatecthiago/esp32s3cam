@@ -2,9 +2,9 @@
  * ============================================================================
  * ARQUIVO: src/main.cpp
  * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
- * INTERVENÇÃO: Teste isolado em resolução fixa 160x120 (sem seletor),
- *              envio enxuto ao Firebase (TLS configurado 1x no setup) e
- *              log de envios ao Firebase logo abaixo da imagem na página.
+ * INTERVENÇÃO: Resolução exclusiva em 320x240 (FRAMESIZE_QVGA), envio ao
+ *              Firebase em camera/stream/latest.json e log acumulativo logo
+ *              abaixo da imagem na página da câmera.
  * ============================================================================
  */
 
@@ -52,14 +52,14 @@ static const char* FIREBASE_LATEST_URL = "https://portaria-cam-default-rtdb.fire
 WebServer server(80);
 static bool camOk = false;
 static bool temPsram = false;
-static framesize_t currentFrameSize = FRAMESIZE_QQVGA;
-static const int currentW = 160;
-static const int currentH = 120;
+static const framesize_t currentFrameSize = FRAMESIZE_QVGA;
+static const int currentW = 320;
+static const int currentH = 240;
 
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
 static unsigned long lastClientReqMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 600;
+static const unsigned long FIREBASE_INTERVAL_MS = 500;
 static const unsigned long WEB_ACTIVE_PAUSE_MS = 2500;
 
 static String lastFbLog = "Aguardando primeiro envio ao Firebase...";
@@ -67,6 +67,8 @@ static int lastFbCode = 0;
 static unsigned long lastFbDurationMs = 0;
 
 static WiFiClientSecure fbClient;
+static HTTPClient fbHttp;
+static bool fbHttpIniciado = false;
 
 static bool initCamera() {
   temPsram = psramFound();
@@ -135,6 +137,22 @@ static bool conectarWifi() {
   return false;
 }
 
+static bool garantirClienteFirebase() {
+  if (fbHttpIniciado) return true;
+  fbClient.setInsecure();
+  fbClient.setTimeout(3);
+  fbHttp.setTimeout(3000);
+  fbHttp.setReuse(true);
+  if (!fbHttp.begin(fbClient, FIREBASE_LATEST_URL)) {
+    fbHttp.end();
+    fbHttpIniciado = false;
+    return false;
+  }
+  fbHttp.addHeader("Content-Type", "application/json");
+  fbHttpIniciado = true;
+  return true;
+}
+
 static void enviarFrameFirebase(camera_fb_t* fb) {
   if (!fb || !fb->buf || fb->len == 0 || WiFi.status() != WL_CONNECTED) {
     lastFbCode = -1;
@@ -148,24 +166,15 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
   unsigned long nextFrame = frameSeq + 1;
 
   String payload;
-  payload.reserve(b64.length() + 150);
-  payload += "{\"formato\":\"rgb565\"";
-  payload += ",\"w\":160,\"h\":120";
-  payload += ",\"frame\":";
+  payload.reserve(b64.length() + 96);
+  payload += "{\"formato\":\"rgb565\",\"w\":320,\"h\":240,\"frame\":";
   payload += String(nextFrame);
-  payload += ",\"ts\":";
-  payload += String(millis());
   payload += ",\"dados\":\"";
   payload += b64;
   payload += "\"}";
   b64 = "";
 
-  HTTPClient http;
-  http.setTimeout(3500);
-  http.setReuse(true);
-
-  if (!http.begin(fbClient, FIREBASE_LATEST_URL)) {
-    http.end();
+  if (!garantirClienteFirebase()) {
     lastFbCode = -2;
     lastFbDurationMs = millis() - tInicio;
     lastFbLog = "FB #" + String(nextFrame) + " FALHA begin (" + String(lastFbDurationMs) + " ms)";
@@ -173,9 +182,7 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
     return;
   }
 
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PUT(payload);
-  http.end();
+  int code = fbHttp.PUT(payload);
   payload = "";
 
   lastFbCode = code;
@@ -185,6 +192,8 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
     frameSeq = nextFrame;
     lastFbLog = "FB #" + String(frameSeq) + " OK (HTTP " + String(code) + ") em " + String(lastFbDurationMs) + " ms";
   } else {
+    fbHttp.end();
+    fbHttpIniciado = false;
     lastFbLog = "FB #" + String(nextFrame) + " ERRO (HTTP " + String(code) + ") em " + String(lastFbDurationMs) + " ms";
   }
   Serial.println(lastFbLog);
@@ -204,22 +213,25 @@ static String escapeJsonStr(const String& s) {
 static void handleRoot() {
   lastClientReqMs = millis();
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Teste 160x120 + Log Firebase</title></head>";
+  html += "<title>Resolucao 320x240 + Log Firebase</title></head>";
   html += "<body style='background:#111;color:#eee;font-family:monospace;padding:12px;text-align:center;'>";
-  html += "<h3 style='margin-bottom:8px;'>Resolucao Fixa 160x120</h3>";
-  html += "<canvas id='c' width='160' height='120' style='border:1px solid #00ffcc;width:320px;max-width:100%;height:auto;background:#000;display:block;margin:0 auto 12px;'></canvas>";
-  html += "<div id='logBox' style='background:#1a1a1a;border:1px solid #444;border-radius:6px;padding:10px;font-size:12px;text-align:left;max-width:480px;margin:0 auto;line-height:1.45;'>Iniciando log...</div>";
+  html += "<h3 style='margin-bottom:8px;'>Resolucao Exclusiva 320x240</h3>";
+  html += "<canvas id='c' width='320' height='240' style='border:1px solid #00ffcc;max-width:100%;height:auto;background:#000;display:block;margin:0 auto 12px;'></canvas>";
+  html += "<div id='logBox' style='background:#1a1a1a;border:1px solid #444;border-radius:6px;padding:10px;font-size:12px;text-align:left;max-width:480px;margin:0 auto;line-height:1.5;max-height:220px;overflow-y:auto;'>Aguardando envios ao Firebase...</div>";
   html += "<script>";
   html += "const c=document.getElementById('c'),ctx=c.getContext('2d'),logBox=document.getElementById('logBox');";
-  html += "const w=160,h=120; let busy=false,historico=[];";
-  html += "function addLinha(txt){ historico.unshift(txt); if(historico.length>8) historico.pop(); logBox.innerHTML=historico.join('<br>'); }";
+  html += "const w=320,h=240; let busy=false,ultimoFrameRegistrado=0,linhas=[];";
+  html += "function registrarLog(linha){ linhas.unshift(linha); if(linhas.length>15) linhas.pop(); logBox.innerHTML=linhas.join('<br>'); }";
   html += "async function refreshInfo(){";
   html += "  try{";
   html += "    const r=await fetch('/info',{cache:'no-store'});";
   html += "    const j=await r.json();";
-  html += "    const topo='<b>'+j.lastLog+'</b> | Heap: '+j.heapFree+' B | PSRAM Livre: '+j.psramFree+' B';";
-  html += "    historico[0]=topo;";
-  html += "    logBox.innerHTML=historico.join('<br>');";
+  html += "    if(j.fbFrame > ultimoFrameRegistrado){";
+  html += "      ultimoFrameRegistrado = j.fbFrame;";
+  html += "      registrarLog('<b>' + j.lastLog + '</b> | Heap: ' + j.heapFree + ' B');";
+  html += "    } else if(linhas.length === 0){";
+  html += "      logBox.innerHTML = j.lastLog + ' | Heap: ' + j.heapFree + ' B';";
+  html += "    }";
   html += "  }catch(e){}";
   html += "}";
   html += "async function tick(){";
@@ -245,7 +257,7 @@ static void handleRoot() {
   html += "  }";
   html += "  setTimeout(tick,200);";
   html += "}";
-  html += "addLinha('Aguardando dados do ESP32...'); refreshInfo(); setInterval(refreshInfo,1000); tick();";
+  html += "refreshInfo(); setInterval(refreshInfo,800); tick();";
   html += "</script></body></html>";
   server.send(200, "text/html", html);
 }
@@ -253,7 +265,7 @@ static void handleRoot() {
 static void handleInfo() {
   lastClientReqMs = millis();
   String json = "{";
-  json += "\"w\":160,\"h\":120,";
+  json += "\"w\":320,\"h\":240,";
   json += "\"fbFrame\":" + String(frameSeq) + ",";
   json += "\"lastCode\":" + String(lastFbCode) + ",";
   json += "\"lastMs\":" + String(lastFbDurationMs) + ",";
@@ -284,11 +296,8 @@ void setup() {
   Serial.begin(115200);
   delay(400);
 
-  fbClient.setInsecure();
-  fbClient.setTimeout(3);
-
   camOk = initCamera();
-  Serial.println(camOk ? "CAM_OK (160x120)" : "CAM_FAIL");
+  Serial.println(camOk ? "CAM_OK (320x240)" : "CAM_FAIL");
 
   conectarWifi();
 
