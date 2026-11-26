@@ -2,9 +2,9 @@
  * ============================================================================
  * ARQUIVO: src/main.cpp
  * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
- * INTERVENÇÃO: Correção para PIXFORMAT_RGB565 (sensor sem JPEG nativo) com
- *              PSRAM ativa e envio único em camera/stream/latest.json
- *              ("formato":"rgb565", "dados":...) compatível com Portaria-cam.
+ * INTERVENÇÃO: Seletor de resolução flexível (160x120, 320x240, 640x480) com
+ *              descarte de buffers antigos na troca, XCLK em 10MHz e envio
+ *              único em RGB565 para camera/stream/latest.json.
  * ============================================================================
  */
 
@@ -78,12 +78,24 @@ static void dimsForSize(framesize_t fs, int& w, int& h) {
   }
 }
 
+static void descartarBuffersAntigos(int maxDescartes) {
+  for (int i = 0; i < maxDescartes; i++) {
+    camera_fb_t* oldFb = esp_camera_fb_get();
+    if (!oldFb) break;
+    esp_camera_fb_return(oldFb);
+    delay(15);
+  }
+}
+
 static bool applyCameraSize(framesize_t fs) {
   sensor_t* s = esp_camera_sensor_get();
   if (!s) return false;
   if (s->set_framesize(s, fs) != 0) return false;
+
   currentFrameSize = fs;
   dimsForSize(fs, currentW, currentH);
+  delay(60);
+  descartarBuffersAntigos(2);
   return true;
 }
 
@@ -121,7 +133,7 @@ static bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 12000000;
+  config.xclk_freq_hz = 10000000;
   config.frame_size   = currentFrameSize;
   config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode    = CAMERA_GRAB_LATEST;
