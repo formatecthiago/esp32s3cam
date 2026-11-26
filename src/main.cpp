@@ -3,8 +3,9 @@
  * ARQUIVO: src/main.cpp
  * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
  * INTERVENÇÃO: Seletor de resolução flexível (160x120, 320x240, 640x480) com
- *              descarte de buffers antigos na troca, XCLK em 10MHz e envio
- *              único em RGB565 para camera/stream/latest.json.
+ *              descarte de buffers antigos na troca, XCLK em 10MHz, envio
+ *              único em RGB565 para camera/stream/latest.json e intervalo
+ *              reduzido para 500ms com timeouts curtos.
  * ============================================================================
  */
 
@@ -59,7 +60,7 @@ static int currentH = 240;
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
 static unsigned long lastClientReqMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 1200;
+static const unsigned long FIREBASE_INTERVAL_MS = 500;
 static const unsigned long WEB_ACTIVE_PAUSE_MS = 2500;
 
 static WiFiClientSecure fbClient;
@@ -197,12 +198,12 @@ static void enviarFrameFirebase(camera_fb_t* fb) {
 
   if (!fbClientReady) {
     fbClient.setInsecure();
-    fbClient.setTimeout(6);
+    fbClient.setTimeout(3);
     fbClientReady = true;
   }
 
   HTTPClient http;
-  http.setTimeout(6000);
+  http.setTimeout(3000);
   http.setReuse(true);
 
   if (!http.begin(fbClient, FIREBASE_LATEST_URL)) {
