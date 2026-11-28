@@ -2,9 +2,9 @@
  * ============================================================================
  * ARQUIVO: src/main.cpp
  * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
- * INTERVENÇÃO: Resolução 320x240, conversão RGB565 -> JPEG via fmt2jpg(),
- *              envio contínuo ao Firebase em Task no Core 0 e log acumulativo
- *              com tempos de conversão (jpg), Base64 (b64) e envio (put).
+ * INTERVENÇÃO: Versão otimizada em 320x240 RGB565->JPEG + Task no Core 0,
+ *              intervalo ajustado (220ms), buffer ajustado ao tamanho real
+ *              do JPEG e log detalhado (jpg, b64, put, KB e Heap).
  * ============================================================================
  */
 
@@ -63,7 +63,7 @@ static const int JPEG_QUALITY = 65;
 
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 300;
+static const unsigned long FIREBASE_INTERVAL_MS = 220;
 
 static String lastFbLog = "Aguardando primeiro envio JPEG ao Firebase...";
 static int lastFbCode = 0;
@@ -152,7 +152,7 @@ static bool garantirClienteFirebase() {
   if (fbHttpIniciado) return true;
   fbClient.setInsecure();
   fbClient.setTimeout(3);
-  fbHttp.setTimeout(2500);
+  fbHttp.setTimeout(2200);
   fbHttp.setReuse(true);
   if (!fbHttp.begin(fbClient, FIREBASE_LATEST_URL)) {
     fbHttp.end();
@@ -239,12 +239,14 @@ static void firebaseTask(void* pvParameters) {
       fbPayload = "";
 
       unsigned long totalMs = millis() - tInicio;
+      size_t kbSize = (jpgLen + 512) / 1024;
+      if (kbSize == 0) kbSize = 1;
 
       if (code > 0 && code < 300) {
         String msg = "FB #" + String(proxFrame) + " OK (HTTP " + String(code) + ") " +
                      String(totalMs) + "ms [jpg:" + String(tJpgMs) +
                      "ms b64:" + String(tB64Ms) + "ms put:" + String(tPutMs) +
-                     "ms " + String(jpgLen / 1024) + "KB]";
+                     "ms " + String(kbSize) + "KB]";
         registrarLogSeguro(msg, code, totalMs, proxFrame);
       } else {
         fbHttp.end();
@@ -258,7 +260,7 @@ static void firebaseTask(void* pvParameters) {
       envioEmAndamento = false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(8));
   }
 }
 
@@ -309,7 +311,7 @@ static void handleRoot() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>320x240 JPEG + Log Firebase</title></head>";
   html += "<body style='background:#111;color:#eee;font-family:monospace;padding:12px;text-align:center;'>";
-  html += "<h3 style='margin-bottom:8px;'>320x240 JPEG + Core 0</h3>";
+  html += "<h3 style='margin-bottom:8px;'>320x240 JPEG + Core 0 (Otimizado)</h3>";
   html += "<canvas id='c' width='320' height='240' style='border:1px solid #00ffcc;max-width:100%;height:auto;background:#000;display:block;margin:0 auto 12px;'></canvas>";
   html += "<div id='logBox' style='background:#1a1a1a;border:1px solid #444;border-radius:6px;padding:10px;font-size:12px;text-align:left;max-width:540px;margin:0 auto;line-height:1.5;max-height:240px;overflow-y:auto;'>Aguardando envios ao Firebase...</div>";
   html += "<script>";
@@ -325,7 +327,7 @@ static void handleRoot() {
   html += "      registrarLog('<b>' + j.lastLog + '</b> | Heap: ' + j.heapFree + ' B');";
   html += "    }";
   html += "  }catch(e){}";
-  html += "  setTimeout(refreshInfo,700);";
+  html += "  setTimeout(refreshInfo,650);";
   html += "}";
   html += "async function tick(){";
   html += "  if(!busy){ busy=true;";
@@ -410,7 +412,7 @@ void setup() {
 
   camMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
-  fbPayload.reserve(45000);
+  fbPayload.reserve(24000);
 
   camOk = initCamera();
   Serial.println(camOk ? "CAM_OK (320x240 RGB565->JPEG)" : "CAM_FAIL");
