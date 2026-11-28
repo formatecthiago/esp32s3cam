@@ -2,9 +2,10 @@
  * ============================================================================
  * ARQUIVO: src/main.cpp
  * PROJETO: Portaria-Cam (ESP32-S3-WROOM-1 MCN16R8 - 16MB Flash / 8MB PSRAM)
- * INTERVENÇÃO: Versão otimizada em 320x240 RGB565->JPEG + Task no Core 0,
- *              intervalo ajustado (220ms), buffer ajustado ao tamanho real
- *              do JPEG e log detalhado (jpg, b64, put, KB e Heap).
+ * INTERVENÇÃO: Mantém envio JPEG + Core 0 com intervalo ajustado (150ms) e
+ *              qualidade inicial 72, adicionando a página /controles com
+ *              visualização, 3 resoluções (160x120, 320x240, 640x480) e
+ *              controles de qualidade JPEG, brilho, contraste, saturação e ganho.
  * ============================================================================
  */
 
@@ -56,14 +57,19 @@ static const char* FIREBASE_LATEST_URL = "https://portaria-cam-default-rtdb.fire
 WebServer server(80);
 static bool camOk = false;
 static bool temPsram = false;
-static const framesize_t currentFrameSize = FRAMESIZE_QVGA;
-static const int currentW = 320;
-static const int currentH = 240;
-static const int JPEG_QUALITY = 65;
+
+static framesize_t currentFrameSize = FRAMESIZE_QVGA;
+static int currentW = 320;
+static int currentH = 240;
+static int jpegQuality = 72;
+static int camBrightness = 0;   // -2 a 2
+static int camContrast = 0;     // -2 a 2
+static int camSaturation = 0;   // -2 a 2
+static int camGainCeiling = 2;  // 0 a 6 (gainceiling_t)
+static unsigned long firebaseIntervalMs = 150;
 
 static unsigned long frameSeq = 0;
 static unsigned long lastFirebaseMs = 0;
-static const unsigned long FIREBASE_INTERVAL_MS = 220;
 
 static String lastFbLog = "Aguardando primeiro envio JPEG ao Firebase...";
 static int lastFbCode = 0;
@@ -75,11 +81,40 @@ static SemaphoreHandle_t stateMutex = nullptr;
 static volatile bool envioEmAndamento = false;
 static uint8_t* pendingJpgBuf = nullptr;
 static size_t pendingJpgLen = 0;
+static int pendingW = 320;
+static int pendingH = 240;
 static unsigned long pendingJpgMs = 0;
 
 static WiFiClientSecure fbClient;
 static HTTPClient fbHttp;
 static bool fbHttpIniciado = false;
+
+static void aplicarParametrosSensor() {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+
+  s->set_framesize(s, currentFrameSize);
+  s->set_brightness(s, camBrightness);
+  s->set_contrast(s, camContrast);
+  s->set_saturation(s, camSaturation);
+  s->set_gainceiling(s, (gainceiling_t)camGainCeiling);
+}
+
+static void definirResolucao(int modo) {
+  if (modo == 1) {
+    currentFrameSize = FRAMESIZE_QQVGA;
+    currentW = 160;
+    currentH = 120;
+  } else if (modo == 3) {
+    currentFrameSize = FRAMESIZE_VGA;
+    currentW = 640;
+    currentH = 480;
+  } else {
+    currentFrameSize = FRAMESIZE_QVGA;
+    currentW = 320;
+    currentH = 240;
+  }
+}
 
 static bool initCamera() {
   temPsram = psramFound();
@@ -117,7 +152,11 @@ static bool initCamera() {
   config.fb_location  = temPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.fb_count     = temPsram ? 2 : 1;
 
-  return (esp_camera_init(&config) == ESP_OK);
+  bool ok = (esp_camera_init(&config) == ESP_OK);
+  if (ok) {
+    aplicarParametrosSensor();
+  }
+  return ok;
 }
 
 static bool conectarWifi() {
@@ -180,12 +219,16 @@ static void firebaseTask(void* pvParameters) {
   for (;;) {
     uint8_t* jpgBuf = nullptr;
     size_t jpgLen = 0;
+    int wEnv = 320;
+    int hEnv = 240;
     unsigned long tJpgMs = 0;
 
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       if (envioEmAndamento && pendingJpgBuf != nullptr && pendingJpgLen > 0) {
         jpgBuf = pendingJpgBuf;
         jpgLen = pendingJpgLen;
+        wEnv = pendingW;
+        hEnv = pendingH;
         tJpgMs = pendingJpgMs;
         pendingJpgBuf = nullptr;
         pendingJpgLen = 0;
@@ -216,7 +259,11 @@ static void firebaseTask(void* pvParameters) {
       }
 
       fbPayload = "";
-      fbPayload += "{\"formato\":\"jpeg\",\"w\":320,\"h\":240,\"frame\":";
+      fbPayload += "{\"formato\":\"jpeg\",\"w\":";
+      fbPayload += String(wEnv);
+      fbPayload += ",\"h\":";
+      fbPayload += String(hEnv);
+      fbPayload += ",\"frame\":";
       fbPayload += String(proxFrame);
       fbPayload += ",\"dados\":\"";
       fbPayload += b64;
@@ -260,7 +307,7 @@ static void firebaseTask(void* pvParameters) {
       envioEmAndamento = false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(8));
+    vTaskDelay(pdMS_TO_TICKS(6));
   }
 }
 
@@ -271,10 +318,12 @@ static void agendarEnvioFirebase() {
   if (xSemaphoreTake(camMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
     fb = esp_camera_fb_get();
     if (fb) {
+      int wAtual = fb->width > 0 ? fb->width : currentW;
+      int hAtual = fb->height > 0 ? fb->height : currentH;
       uint8_t* jpgOut = nullptr;
       size_t jpgLen = 0;
       unsigned long t0 = millis();
-      bool ok = fmt2jpg(fb->buf, fb->len, currentW, currentH, PIXFORMAT_RGB565, JPEG_QUALITY, &jpgOut, &jpgLen);
+      bool ok = fmt2jpg(fb->buf, fb->len, wAtual, hAtual, PIXFORMAT_RGB565, jpegQuality, &jpgOut, &jpgLen);
       unsigned long tJpg = millis() - t0;
       esp_camera_fb_return(fb);
 
@@ -282,6 +331,8 @@ static void agendarEnvioFirebase() {
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
           pendingJpgBuf = jpgOut;
           pendingJpgLen = jpgLen;
+          pendingW = wAtual;
+          pendingH = hAtual;
           pendingJpgMs = tJpg;
           envioEmAndamento = true;
           xSemaphoreGive(stateMutex);
@@ -309,14 +360,15 @@ static String escapeJsonStr(const String& s) {
 
 static void handleRoot() {
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>320x240 JPEG + Log Firebase</title></head>";
+  html += "<title>Portaria-Cam Monitor + Log</title></head>";
   html += "<body style='background:#111;color:#eee;font-family:monospace;padding:12px;text-align:center;'>";
   html += "<h3 style='margin-bottom:8px;'>320x240 JPEG + Core 0 (Otimizado)</h3>";
+  html += "<div style='margin-bottom:10px;'><a href='/controles' style='display:inline-block;padding:8px 14px;background:#00ffcc;color:#111;text-decoration:none;border-radius:6px;font-weight:bold;'>Abrir Controles e Resolucao</a></div>";
   html += "<canvas id='c' width='320' height='240' style='border:1px solid #00ffcc;max-width:100%;height:auto;background:#000;display:block;margin:0 auto 12px;'></canvas>";
   html += "<div id='logBox' style='background:#1a1a1a;border:1px solid #444;border-radius:6px;padding:10px;font-size:12px;text-align:left;max-width:540px;margin:0 auto;line-height:1.5;max-height:240px;overflow-y:auto;'>Aguardando envios ao Firebase...</div>";
   html += "<script>";
   html += "const c=document.getElementById('c'),ctx=c.getContext('2d'),logBox=document.getElementById('logBox');";
-  html += "const w=320,h=240; let busy=false,ultimoFrameRegistrado=0,linhas=[];";
+  html += "let busy=false,ultimoFrameRegistrado=0,linhas=[];";
   html += "function registrarLog(linha){ linhas.unshift(linha); if(linhas.length>20) linhas.pop(); logBox.innerHTML=linhas.join('<br>'); }";
   html += "async function refreshInfo(){";
   html += "  try{";
@@ -327,15 +379,18 @@ static void handleRoot() {
   html += "      registrarLog('<b>' + j.lastLog + '</b> | Heap: ' + j.heapFree + ' B');";
   html += "    }";
   html += "  }catch(e){}";
-  html += "  setTimeout(refreshInfo,650);";
+  html += "  setTimeout(refreshInfo,600);";
   html += "}";
   html += "async function tick(){";
   html += "  if(!busy){ busy=true;";
   html += "    try{";
   html += "      const r=await fetch('/frame?t='+Date.now(),{cache:'no-store'});";
   html += "      if(r.ok){";
+  html += "        const w=parseInt(r.headers.get('X-Frame-W')||'320',10);";
+  html += "        const h=parseInt(r.headers.get('X-Frame-H')||'240',10);";
   html += "        const buf=new Uint8Array(await r.arrayBuffer());";
   html += "        if(buf.length===w*h*2){";
+  html += "          if(c.width!==w||c.height!==h){c.width=w;c.height=h;}";
   html += "          const img=ctx.createImageData(w,h),d=img.data;";
   html += "          for(let i=0;i<w*h;i++){";
   html += "            const p=(buf[i*2]<<8)|buf[i*2+1];";
@@ -350,11 +405,121 @@ static void handleRoot() {
   html += "    }catch(e){}";
   html += "    busy=false;";
   html += "  }";
-  html += "  setTimeout(tick,150);";
+  html += "  setTimeout(tick,140);";
   html += "}";
   html += "refreshInfo(); tick();";
   html += "</script></body></html>";
   server.send(200, "text/html", html);
+}
+
+static void handleControles() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Controles da Camera</title></head>";
+  html += "<body style='background:#111;color:#eee;font-family:sans-serif;padding:14px;max-width:520px;margin:0 auto;'>";
+  html += "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;'>";
+  html += "<h3 style='margin:0;color:#00ffcc;'>Controles e Resolucao</h3>";
+  html += "<a href='/' style='color:#00ffcc;text-decoration:none;border:1px solid #00ffcc;padding:6px 10px;border-radius:6px;font-size:13px;'>Voltar ao Log</a>";
+  html += "</div>";
+  html += "<canvas id='c' width='320' height='240' style='border:1px solid #00ffcc;width:100%;height:auto;background:#000;border-radius:8px;display:block;margin-bottom:14px;'></canvas>";
+  html += "<div style='background:#1b1b1b;padding:12px;border-radius:8px;border:1px solid #333;margin-bottom:14px;'>";
+  html += "<div style='font-size:13px;font-weight:bold;margin-bottom:8px;color:#00ffcc;'>Resolucao (3 opcoes)</div>";
+  html += "<div style='display:flex;gap:8px;flex-wrap:wrap;'>";
+  html += "<button onclick='setRes(1)' style='flex:1;padding:10px;border:none;border-radius:6px;background:#2c2c2c;color:#fff;font-weight:bold;'>160x120</button>";
+  html += "<button onclick='setRes(2)' style='flex:1;padding:10px;border:none;border-radius:6px;background:#2c2c2c;color:#fff;font-weight:bold;'>320x240</button>";
+  html += "<button onclick='setRes(3)' style='flex:1;padding:10px;border:none;border-radius:6px;background:#2c2c2c;color:#fff;font-weight:bold;'>640x480</button>";
+  html += "</div></div>";
+
+  html += "<div style='background:#1b1b1b;padding:12px;border-radius:8px;border:1px solid #333;font-size:13px;'>";
+  html += "<div style='margin-bottom:10px;'>Qualidade JPEG: <b id='vQual'>" + String(jpegQuality) + "</b><br><input id='sQual' type='range' min='20' max='90' value='" + String(jpegQuality) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div style='margin-bottom:10px;'>Claridade / Ganho Maximo: <b id='vGain'>" + String(camGainCeiling) + "</b><br><input id='sGain' type='range' min='0' max='6' value='" + String(camGainCeiling) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div style='margin-bottom:10px;'>Brilho: <b id='vBright'>" + String(camBrightness) + "</b><br><input id='sBright' type='range' min='-2' max='2' value='" + String(camBrightness) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div style='margin-bottom:10px;'>Contraste: <b id='vCont'>" + String(camContrast) + "</b><br><input id='sCont' type='range' min='-2' max='2' value='" + String(camContrast) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div style='margin-bottom:10px;'>Saturacao: <b id='vSat'>" + String(camSaturation) + "</b><br><input id='sSat' type='range' min='-2' max='2' value='" + String(camSaturation) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div style='margin-bottom:6px;'>Intervalo Firebase (ms): <b id='vInt'>" + String(firebaseIntervalMs) + "</b><br><input id='sInt' type='range' min='100' max='1000' step='10' value='" + String(firebaseIntervalMs) + "' style='width:100%;' onchange='aplicar()'></div>";
+  html += "<div id='msgCtrl' style='color:#00ffcc;margin-top:8px;font-size:12px;'>Pronto</div>";
+  html += "</div>";
+
+  html += "<script>";
+  html += "const c=document.getElementById('c'),ctx=c.getContext('2d'); let busy=false;";
+  html += "function syncLabels(){";
+  html += "  vQual.textContent=sQual.value; vGain.textContent=sGain.value; vBright.textContent=sBright.value;";
+  html += "  vCont.textContent=sCont.value; vSat.textContent=sSat.value; vInt.textContent=sInt.value;";
+  html += "}";
+  html += "async function setRes(m){";
+  html += "  msgCtrl.textContent='Aplicando resolucao...';";
+  html += "  const r=await fetch('/set?res='+m,{cache:'no-store'});";
+  html += "  if(r.ok){ msgCtrl.textContent='Resolucao aplicada ('+await r.text()+')'; }";
+  html += "}";
+  html += "async function aplicar(){";
+  html += "  syncLabels();";
+  html += "  const q='/set?qual='+sQual.value+'&gain='+sGain.value+'&bright='+sBright.value+'&cont='+sCont.value+'&sat='+sSat.value+'&interval='+sInt.value;";
+  html += "  const r=await fetch(q,{cache:'no-store'});";
+  html += "  if(r.ok){ msgCtrl.textContent='Parametros atualizados'; }";
+  html += "}";
+  html += "async function tick(){";
+  html += "  if(!busy){ busy=true;";
+  html += "    try{";
+  html += "      const r=await fetch('/frame?t='+Date.now(),{cache:'no-store'});";
+  html += "      if(r.ok){";
+  html += "        const w=parseInt(r.headers.get('X-Frame-W')||'320',10);";
+  html += "        const h=parseInt(r.headers.get('X-Frame-H')||'240',10);";
+  html += "        const buf=new Uint8Array(await r.arrayBuffer());";
+  html += "        if(buf.length===w*h*2){";
+  html += "          if(c.width!==w||c.height!==h){c.width=w;c.height=h;}";
+  html += "          const img=ctx.createImageData(w,h),d=img.data;";
+  html += "          for(let i=0;i<w*h;i++){";
+  html += "            const p=(buf[i*2]<<8)|buf[i*2+1];";
+  html += "            d[i*4]=((p>>11)&31)*255/31;";
+  html += "            d[i*4+1]=((p>>5)&63)*255/63;";
+  html += "            d[i*4+2]=(p&31)*255/31;";
+  html += "            d[i*4+3]=255;";
+  html += "          }";
+  html += "          ctx.putImageData(img,0,0);";
+  html += "        }";
+  html += "      }";
+  html += "    }catch(e){}";
+  html += "    busy=false;";
+  html += "  }";
+  html += "  setTimeout(tick,160);";
+  html += "}";
+  html += "syncLabels(); tick();";
+  html += "</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+static void handleSet() {
+  if (xSemaphoreTake(camMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (server.hasArg("res")) {
+      definirResolucao(server.arg("res").toInt());
+    }
+    if (server.hasArg("qual")) {
+      int q = server.arg("qual").toInt();
+      if (q >= 10 && q <= 95) jpegQuality = q;
+    }
+    if (server.hasArg("gain")) {
+      int g = server.arg("gain").toInt();
+      if (g >= 0 && g <= 6) camGainCeiling = g;
+    }
+    if (server.hasArg("bright")) {
+      int b = server.arg("bright").toInt();
+      if (b >= -2 && b <= 2) camBrightness = b;
+    }
+    if (server.hasArg("cont")) {
+      int cVal = server.arg("cont").toInt();
+      if (cVal >= -2 && cVal <= 2) camContrast = cVal;
+    }
+    if (server.hasArg("sat")) {
+      int sVal = server.arg("sat").toInt();
+      if (sVal >= -2 && sVal <= 2) camSaturation = sVal;
+    }
+    if (server.hasArg("interval")) {
+      unsigned long iv = (unsigned long)server.arg("interval").toInt();
+      if (iv >= 80 && iv <= 5000) firebaseIntervalMs = iv;
+    }
+    aplicarParametrosSensor();
+    xSemaphoreGive(camMutex);
+  }
+  server.send(200, "text/plain", String(currentW) + "x" + String(currentH));
 }
 
 static void handleInfo() {
@@ -372,7 +537,7 @@ static void handleInfo() {
   }
 
   String json = "{";
-  json += "\"w\":320,\"h\":240,";
+  json += "\"w\":" + String(currentW) + ",\"h\":" + String(currentH) + ",";
   json += "\"fbFrame\":" + String(frameCopy) + ",";
   json += "\"lastCode\":" + String(codeCopy) + ",";
   json += "\"lastMs\":" + String(msCopy) + ",";
@@ -398,6 +563,8 @@ static void handleFrame() {
       return;
     }
     server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Frame-W", String(fb->width > 0 ? fb->width : currentW));
+    server.sendHeader("X-Frame-H", String(fb->height > 0 ? fb->height : currentH));
     server.send_P(200, "application/octet-stream", (const char*)fb->buf, fb->len);
     esp_camera_fb_return(fb);
     xSemaphoreGive(camMutex);
@@ -412,7 +579,7 @@ void setup() {
 
   camMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
-  fbPayload.reserve(24000);
+  fbPayload.reserve(36000);
 
   camOk = initCamera();
   Serial.println(camOk ? "CAM_OK (320x240 RGB565->JPEG)" : "CAM_FAIL");
@@ -420,6 +587,8 @@ void setup() {
   conectarWifi();
 
   server.on("/", handleRoot);
+  server.on("/controles", handleControles);
+  server.on("/set", handleSet);
   server.on("/info", handleInfo);
   server.on("/frame", handleFrame);
   server.begin();
@@ -440,7 +609,7 @@ void loop() {
 
   if (camOk && WiFi.status() == WL_CONNECTED) {
     unsigned long agora = millis();
-    if (!envioEmAndamento && (lastFirebaseMs == 0 || (agora - lastFirebaseMs) >= FIREBASE_INTERVAL_MS)) {
+    if (!envioEmAndamento && (lastFirebaseMs == 0 || (agora - lastFirebaseMs) >= firebaseIntervalMs)) {
       lastFirebaseMs = agora;
       agendarEnvioFirebase();
     }
